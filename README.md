@@ -1,6 +1,6 @@
 # FlatAI: An Advanced Deep Learning Approach to Astrophotography Image Correction
 
-**FlatAI** is a sophisticated, 34-million-parameter U-Net based neural network designed to tackle complex image correction tasks in astrophotography. The project has evolved through two primary phases:
+**FlatAI** is a sophisticated, 40-million-parameter U-Net based neural network designed to tackle complex image correction tasks in astrophotography. The project has evolved through two primary phases:
 
 1.  **Synthetic Flat-Frame Generation:** The current focus of the project. The model learns to remove artifacts like dust motes, vignetting, and uneven illumination from astronomical images, effectively creating a perfect "flat frame" on the fly.
 2.  **Optical Aberration Correction (Physics-Informed):** The original goal. This version of the model was a Physics-Informed Neural Network (PINN) trained to correct optical aberrations like coma by simulating and then reversing them.
