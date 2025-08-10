@@ -190,3 +190,4 @@ unet_corrector_model.pth
 old_sharps/
 epoch_0162_sample.png
 requirements.txt
+test_flat_artifacts.py
