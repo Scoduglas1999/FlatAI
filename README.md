@@ -151,13 +151,15 @@ The model is then trained to take an "affected" image and reproduce the "perfect
 
 The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
 
-$$\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}$$
+```
+L_total = λ_L1 × L_L1 + λ_LPIPS × L_LPIPS + λ_Style × L_Style + λ_Physics × L_Physics
+```
 
 Where:
-- $\mathcal{L}_{\text{L1}}$: A pixel-level L1 loss for basic reconstruction accuracy.
-- $\mathcal{L}_{\text{LPIPS}}$: The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
-- $\mathcal{L}_{\text{Style}}$: A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
-- $\mathcal{L}_{\text{Physics}}$: A physics-consistency loss. The model's output $I_{\text{pred}}$ is fed back into the forward physics model to reconstruct the observed image: $I_{\text{reconstructed}} = (I_{\text{pred}} \times F_{\text{mult}}) + G_{\text{add}}$. The loss is the L1 distance between $I_{\text{reconstructed}}$ and the original $I_{\text{observed}}$.
+- **L_L1**: A pixel-level L1 loss for basic reconstruction accuracy.
+- **L_LPIPS**: The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
+- **L_Style**: A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
+- **L_Physics**: A physics-consistency loss. The model's output **I_pred** is fed back into the forward physics model to reconstruct the observed image: **I_reconstructed** = (**I_pred** × **F_mult**) + **G_add**. The loss is the L1 distance between **I_reconstructed** and the original **I_observed**.
 
 ### 2. Optical Aberration (PINN) Model
 
@@ -174,9 +176,11 @@ This model attempts to deconvolve the Point Spread Function (PSF) caused by opti
 
 The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
 
-$$\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}$$
+```
+L_total = λ_L1 × L_L1 + λ_LPIPS × L_LPIPS + λ_Style × L_Style + λ_Physics × L_Physics
+```
 
--   $\mathcal{L}_{\text{Physics}}$: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output $I_{\text{pred}}$ is convolved with the original PSF: $I_{\text{reblurred}} = I_{\text{pred}} * \text{PSF}$. The loss is the L1 distance between $I_{\text{reblurred}}$ and the original blurry input $I_{\text{observed}}$.
+-   **L_Physics**: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output **I_pred** is convolved with the original PSF: **I_reblurred** = **I_pred** * **PSF**. The loss is the L1 distance between **I_reblurred** and the original blurry input **I_observed**.
 
 ## Usage
 
