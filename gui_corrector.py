@@ -3,9 +3,9 @@
 # =============================================================================
 # --- CONFIGURATION FOR TESTING ---
 # =============================================================================
-# TEMPORARY: Force processing mode for debugging
-# Set to True to force linear mode, False for non-linear, None for auto-detect
-FORCE_LINEAR_MODE = True  # <-- Change this to test different modes
+# Processing mode control
+# None = auto-detect (preferred); True = force linear; False = force non-linear
+FORCE_LINEAR_MODE = None
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -31,6 +31,10 @@ except ImportError:
 
 # --- NEW: Import the correct model architecture ---
 from unet_model import AttentionResUNet
+
+# Default model paths
+PREFERRED_MODEL = "./unet_flat_model_final.pth"
+FALLBACK_MODEL = "./unet_flat_checkpoint.pth"
 
 # =============================================================================
 # --- 1. BACKEND PROCESSING LOGIC (copied from run_correction.py) ---
@@ -495,7 +499,17 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
     
     return corrected_image
 
-def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance):
+def pick_model_path(user_path: str | None) -> str:
+    if user_path and os.path.exists(user_path):
+        return user_path
+    if os.path.exists(PREFERRED_MODEL):
+        return PREFERRED_MODEL
+    if os.path.exists(FALLBACK_MODEL):
+        return FALLBACK_MODEL
+    raise FileNotFoundError("No model file selected and no default model found.")
+
+
+def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance, force_mode):
     """
     Core image processing logic. Now handles both grayscale and RGB images with proper data type preservation.
     """
@@ -503,10 +517,12 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         status_callback("Setting up...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        model_path = pick_model_path(model_path)
         status_callback(f"Loading model: {os.path.basename(model_path)}")
         model = AttentionResUNet()
         checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        model.load_state_dict(state_dict, strict=True)
         model.to(device)
         model.eval()
         status_callback("Model loaded successfully!")
@@ -540,7 +556,7 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         if raw_image.ndim == 2:
             # It's grayscale
             status_callback("Processing grayscale image...")
-            final_image = _process_single_channel(raw_image, model, device, progress_callback, status_callback, image_path, FORCE_LINEAR_MODE)
+            final_image = _process_single_channel(raw_image, model, device, progress_callback, status_callback, image_path, force_mode)
         elif raw_image.ndim == 3 and raw_image.shape[0] == 3:
             # It's RGB (3, H, W)
             status_callback("Processing RGB image (channel by channel)...")
@@ -554,7 +570,7 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
                 
                 channel_status("Starting processing...")
                 channel_data = raw_image[i]  # Extract channel from (3, H, W)
-                corrected_channel = _process_single_channel(channel_data, model, device, channel_progress, channel_status, image_path, FORCE_LINEAR_MODE)
+                corrected_channel = _process_single_channel(channel_data, model, device, channel_progress, channel_status, image_path, force_mode)
                 corrected_channels.append(corrected_channel)
             
             # Stack channels back to (3, H, W) format
@@ -562,24 +578,32 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         else:
             raise ValueError(f"Unsupported image shape for processing: {raw_image.shape}")
 
-        # Preserve original data type and range
-        status_callback("Converting to original data type...")
-        if np.issubdtype(original_dtype, np.integer):
-            # For integer types, preserve the original range
-            original_min, original_max = raw_image.min(), raw_image.max()
-            
-            # Clip to ensure we don't exceed the original range
-            final_image = np.clip(final_image, original_min, original_max)
-            
-            # Convert to original integer type
-            final_image = final_image.astype(original_dtype)
-        elif np.issubdtype(original_dtype, np.floating):
-            # For floating point types, just convert to the original precision
-            final_image = final_image.astype(original_dtype)
-        else:
-            # Fallback to float32
-            print(f"Warning: Unknown data type {original_dtype}, using float32")
+        # Preserve type/range with option to force float32 to avoid banding
+        status_callback("Converting to output data type...")
+        if app_instance.save_float32_var.get():
+            # Always save as float32 FITS. Avoids quantization and block artifacts.
             final_image = final_image.astype(np.float32)
+        else:
+            if np.issubdtype(original_dtype, np.integer):
+                # Preserve original integer range using robust percentile scaling
+                # This minimizes banding when the corrected image range changed slightly.
+                src_min = np.percentile(final_image, 0.01)
+                src_max = np.percentile(final_image, 99.99)
+                if src_max > src_min:
+                    scaled = (final_image - src_min) / (src_max - src_min)
+                else:
+                    scaled = np.zeros_like(final_image)
+                # Map back to original min/max
+                orig_min = np.min(raw_image)
+                orig_max = np.max(raw_image)
+                mapped = scaled * (orig_max - orig_min) + orig_min
+                final_image = np.clip(mapped, orig_min, orig_max)
+                final_image = final_image.astype(original_dtype)
+            elif np.issubdtype(original_dtype, np.floating):
+                final_image = final_image.astype(original_dtype)
+            else:
+                print(f"Warning: Unknown data type {original_dtype}, using float32")
+                final_image = final_image.astype(np.float32)
 
         status_callback(f"Saving corrected image to: {output_path}")
         original_header = None
@@ -611,7 +635,7 @@ class CorrectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PSFNet AI Image Corrector")
-        self.geometry("600x400")
+        self.geometry("680x520")
         self.resizable(True, True)
 
         # Variables
@@ -619,6 +643,9 @@ class CorrectorApp(tk.Tk):
         self.model_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.is_processing = False
+        self.force_mode_var = tk.StringVar(value="auto")  # auto|linear|nonlinear
+
+        self.save_float32_var = tk.BooleanVar(value=True)  # default to float32 to avoid banding
 
         self.setup_ui()
         self.update_run_button_state()
@@ -647,8 +674,8 @@ class CorrectorApp(tk.Tk):
         ttk.Button(main_frame, text="Browse...", 
                   command=self.browse_input_image).grid(row=1, column=2, pady=5)
 
-        # Model File Selection
-        ttk.Label(main_frame, text="Model File:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        # Model File Selection (optional; will auto-pick otherwise)
+        ttk.Label(main_frame, text="Model File (optional):").grid(row=2, column=0, sticky=tk.W, pady=5)
         ttk.Entry(main_frame, textvariable=self.model_path, width=50).grid(row=2, column=1, 
                                                                           sticky=(tk.W, tk.E), 
                                                                           padx=5, pady=5)
@@ -663,32 +690,46 @@ class CorrectorApp(tk.Tk):
         ttk.Button(main_frame, text="Browse...", 
                   command=self.browse_output_path).grid(row=3, column=2, pady=5)
 
+        # Mode selector
+        ttk.Label(main_frame, text="Processing Mode:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        mode_frame = ttk.Frame(main_frame)
+        mode_frame.grid(row=4, column=1, sticky=tk.W)
+        ttk.Radiobutton(mode_frame, text="Auto", value="auto", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Linear", value="linear", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Non-linear", value="nonlinear", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
+
+        # Output options
+        opts_frame = ttk.Frame(main_frame)
+        opts_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(opts_frame, text="Save FITS as float32 (recommended to avoid banding)",
+                        variable=self.save_float32_var).pack(side=tk.LEFT, padx=5)
+
         # Run Button
         self.run_button = ttk.Button(main_frame, text="🚀 Run Correction", 
                                     command=self.start_correction)
-        self.run_button.grid(row=4, column=0, columnspan=3, pady=20)
+        self.run_button.grid(row=6, column=0, columnspan=3, pady=20)
 
         # Progress Bar
-        ttk.Label(main_frame, text="Progress:").grid(row=5, column=0, sticky=tk.W, pady=5)
+        ttk.Label(main_frame, text="Progress:").grid(row=7, column=0, sticky=tk.W, pady=5)
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, 
-                                          maximum=100, length=400)
-        self.progress_bar.grid(row=5, column=1, columnspan=2, sticky=(tk.W, tk.E), 
+                                          maximum=100, length=480)
+        self.progress_bar.grid(row=7, column=1, columnspan=2, sticky=(tk.W, tk.E), 
                               padx=5, pady=5)
 
         # Status Label
-        ttk.Label(main_frame, text="Status:").grid(row=6, column=0, sticky=(tk.W, tk.N), pady=5)
+        ttk.Label(main_frame, text="Status:").grid(row=8, column=0, sticky=(tk.W, tk.N), pady=5)
         self.status_var = tk.StringVar(value="Ready. Please select files and click 'Run Correction'.")
         self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
-                                     wraplength=400, justify=tk.LEFT)
-        self.status_label.grid(row=6, column=1, columnspan=2, sticky=(tk.W, tk.E), 
+                                     wraplength=480, justify=tk.LEFT)
+        self.status_label.grid(row=8, column=1, columnspan=2, sticky=(tk.W, tk.E), 
                               padx=5, pady=5)
 
         # Device Info
         device = "CUDA" if torch.cuda.is_available() else "CPU"
         device_label = ttk.Label(main_frame, text=f"Processing Device: {device}", 
                                 font=("Arial", 9))
-        device_label.grid(row=7, column=0, columnspan=3, pady=(20, 0))
+        device_label.grid(row=9, column=0, columnspan=3, pady=(10, 0))
 
     def browse_input_image(self):
         """Browse for input image file."""
@@ -743,13 +784,16 @@ class CorrectorApp(tk.Tk):
 
     def run_correction_thread(self):
         """Wrapper to call the backend logic from a thread."""
+        mode = self.force_mode_var.get()
+        force_mode = None if mode == "auto" else (True if mode == "linear" else False)
         run_correction_logic(
             self.image_path.get(),
             self.model_path.get(),
             self.output_path.get(),
             self.update_progress,
             self.update_status,
-            self # Pass the app instance itself
+            self,  # Pass the app instance itself
+            force_mode,
         )
 
     def update_progress(self, value):

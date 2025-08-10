@@ -117,7 +117,7 @@ SAMPLE_IMAGE_DIR = "./flat_training_samples/"
 LOSS_CURVE_PATH = "./flat_loss_curve.png"
 
 RESUME_TRAINING = True
-FINE_TUNING_MODE = True
+FINE_TUNING_MODE = False
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 8
 NUM_EPOCHS = 150
