@@ -67,7 +67,55 @@ Due to these challenges, the project pivoted to focus on the more constrained, b
 
 The core of the project is an Attention-based Residual U-Net (`unet_model.py`). This architecture uses residual blocks to prevent vanishing gradients and attention gates to focus on salient features from the skip connections.
 
-![AttentionResUNet Architecture](https://i.imgur.com/L1n7Z3H.png)
+![AttentionResUNet Architecture]
+graph TD
+    subgraph Encoder
+        A[Input] --> B(enc1: ResBlock 1->64);
+        B --> C{pool1: MaxPool2d};
+        C --> D(enc2: ResBlock 64->128);
+        D --> E{pool2: MaxPool2d};
+        E --> F(enc3: ResBlock 128->256);
+        F --> G{pool3: MaxPool2d};
+        G --> H(enc4: ResBlock 256->512);
+        H --> I{pool4: MaxPool2d};
+    end
+
+    subgraph Bottleneck
+        I --> J(bottleneck: ResBlock 512->1024);
+    end
+
+    subgraph Decoder
+        J --> K(up4: Upsample);
+        K --> L(dec_conv4: ResBlock 1024->512);
+        subgraph Skip Connection 4
+            H --> M(att4: AttentionGate);
+            L --> M;
+        end
+        M --> N(dec_combine4: ResBlock 1024->512);
+        N --> O(up3: Upsample);
+        O --> P(dec_conv3: ResBlock 512->256);
+        subgraph Skip Connection 3
+            F --> Q(att3: AttentionGate);
+            P --> Q;
+        end
+        Q --> R(dec_combine3: ResBlock 512->256);
+        R --> S(up2: Upsample);
+        S --> T(dec_conv2: ResBlock 256->128);
+        subgraph Skip Connection 2
+            D --> U(att2: AttentionGate);
+            T --> U;
+        end
+        U --> V(dec_combine2: ResBlock 256->128);
+        V --> W(up1: Upsample);
+        W --> X(dec_conv1: ResBlock 128->64);
+        subgraph Skip Connection 1
+            B --> Y(att1: AttentionGate);
+            X --> Y;
+        end
+        Y --> Z(dec_combine1: ResBlock 128->64);
+        Z --> AA(out_conv: Conv2d 64->1);
+        AA --> BB[Output];
+    end
 
 ## Models and Training
 
