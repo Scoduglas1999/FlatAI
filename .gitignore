@@ -187,3 +187,6 @@ unet_flat_checkpoint.pth
 unet_pinn_checkpoint.pth
 unet_pinn_checkpoint - Copy.pth
 unet_corrector_model.pth
+old_sharps/
+epoch_0162_sample.png
+requirements.txt
