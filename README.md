@@ -67,6 +67,9 @@ Due to these challenges, the project pivoted to focus on the more constrained, b
 
 The core of the project is an Attention-based Residual U-Net (`unet_model.py`). This architecture uses residual blocks to prevent vanishing gradients and attention gates to focus on salient features from the skip connections.
 
+<details>
+<summary>Click to expand a diagram of the model architecture</summary>
+
 ```mermaid
 graph TD
     subgraph Encoder
@@ -117,6 +120,7 @@ graph TD
         AA --> BB[Output];
     end
 ```
+</details>
 
 ## Models and Training
 
@@ -142,14 +146,12 @@ The model is then trained to take an "affected" image and reproduce the "perfect
 #### Loss Function
 
 The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
-\[ \mathcal{L}_{total} = \lambda_{L1}\mathcal{L}_{L1} + \lambda_{LPIPS}\mathcal{L}_{LPIPS} + \lambda_{Style}\mathcal{L}_{Style} + \lambda_{Physics}\mathcal{L}_{Physics} \]
+\[ \mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}} \]
 Where:
--   **\(\mathcal{L}_{L1}\):** A pixel-level L1 loss for basic reconstruction accuracy.
--   **\(\mathcal{L}_{LPIPS}\):** The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
--   **\(\mathcal{L}_{Style}\):** A VGG-based style loss calculated from the Gram matrix of feature maps. The Gram matrix is defined as:
-    \[ G_{l}(I) = \frac{1}{C_l H_l W_l} F_l(I) F_l(I)^T \]
-    where \(F_l(I)\) is the flattened feature map from layer \(l\) of a VGG network.
--   **\(\mathcal{L}_{Physics}\):** A physics-consistency loss. The model's output \(I_{pred}\) is fed back into the forward physics model to reconstruct the observed image: \(I_{reconstructed} = (I_{pred} \times F_{mult}) + G_{add}\). The loss is the L1 distance between \(I_{reconstructed}\) and the original \(I_{observed}\).
+-   **\(\mathcal{L}_{\text{L1}}\):** A pixel-level L1 loss for basic reconstruction accuracy.
+-   **\(\mathcal{L}_{\text{LPIPS}}\):** The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
+-   **\(\mathcal{L}_{\text{Style}}\):** A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
+-   **\(\mathcal{L}_{\text{Physics}}\):** A physics-consistency loss. The model's output \(I_{\text{pred}}\) is fed back into the forward physics model to reconstruct the observed image: \(I_{\text{reconstructed}} = (I_{\text{pred}} \times F_{\text{mult}}) + G_{\text{add}}\). The loss is the L1 distance between \(I_{\text{reconstructed}}\) and the original \(I_{\text{observed}}\).
 
 ### 2. Optical Aberration (PINN) Model
 
@@ -165,8 +167,8 @@ This model attempts to deconvolve the Point Spread Function (PSF) caused by opti
 #### Loss Function
 
 The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
-\[ \mathcal{L}_{total} = \lambda_{L1}\mathcal{L}_{L1} + \lambda_{LPIPS}\mathcal{L}_{LPIPS} + \lambda_{Style}\mathcal{L}_{Style} + \lambda_{Physics}\mathcal{L}_{Physics} \]
--   **\(\mathcal{L}_{Physics}\):** The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output \(I_{pred}\) is convolved with the original PSF: \(I_{reblurred} = I_{pred} * PSF\). The loss is the L1 distance between \(I_{reblurred}\) and the original blurry input \(I_{observed}\).
+\[ \mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}} \]
+-   **\(\mathcal{L}_{\text{Physics}}\):** The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output \(I_{\text{pred}}\) is convolved with the original PSF: \(I_{\text{reblurred}} = I_{\text{pred}} * \text{PSF}\). The loss is the L1 distance between \(I_{\text{reblurred}}\) and the original blurry input \(I_{\text{observed}}\).
 
 ## Usage
 
