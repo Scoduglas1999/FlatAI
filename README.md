@@ -5,7 +5,9 @@
 1.  **Synthetic Flat-Frame Generation:** The current focus of the project. The model learns to remove artifacts like dust motes, vignetting, and uneven illumination from astronomical images, effectively creating a perfect "flat frame" on the fly.
 2.  **Optical Aberration Correction (Physics-Informed):** The original goal. This version of the model was a Physics-Informed Neural Network (PINN) trained to correct optical aberrations like coma by simulating and then reversing them.
 
-This repository contains the code for both approaches, representing a comprehensive toolkit for deep-learning-based astrophotography processing.
+This repository contains the code for both approaches, but do note that a significant portion of this project is for personal learning and experimentation.
+
+While looking at the project you may realize that some files seem disjointed, superfluous, or you may notice that there is bad code in some. This is because I have not been culling files as they become unnecessary like I would on a real public project. In the end, I may release the final model once done training, but that day is not today, so browse this repo with caution understanding much of it can seem random at times. 
 
 ## The "Flat-Field" Problem in Astrophotography
 
