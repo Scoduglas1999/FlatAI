@@ -67,7 +67,7 @@ Due to these challenges, the project pivoted to focus on the more constrained, b
 
 The core of the project is an Attention-based Residual U-Net (`unet_model.py`). This architecture uses residual blocks to prevent vanishing gradients and attention gates to focus on salient features from the skip connections.
 
-![AttentionResUNet Architecture]
+```mermaid
 graph TD
     subgraph Encoder
         A[Input] --> B(enc1: ResBlock 1->64);
@@ -116,6 +116,7 @@ graph TD
         Z --> AA(out_conv: Conv2d 64->1);
         AA --> BB[Output];
     end
+```
 
 ## Models and Training
 
