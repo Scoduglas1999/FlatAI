@@ -9,6 +9,8 @@ This repository contains the code for both approaches, but do note that a signif
 
 While looking at the project you may realize that some files seem disjointed, superfluous, or you may notice that there is bad code in some. This is because I have not been culling files as they become unnecessary like I would on a real public project. In the end, I may release the final model once done training, but that day is not today, so browse this repo with caution understanding much of it can seem random at times. 
 
+Training samples will be added in batches as I continue working. I likely will not be uploading each one as they finish, but likely there will be more at least once a day if improvement warrants it. 
+
 ## The "Flat-Field" Problem in Astrophotography
 
 A "flat frame" is a calibration image used to correct for imperfections in the optical train of a telescope (e.g., dust on the sensor, vignetting from the telescope optics). These imperfections create a fixed pattern of "shadows" and brightness variations on every image taken. By dividing the astronomical image by a flat frame, these artifacts can be removed.
