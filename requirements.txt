@@ -1,0 +1,15 @@
+astropy==7.0.1
+lpips==0.1.4
+matplotlib==3.7.1
+numpy==2.3.2
+pandas==2.3.1
+photutils==2.2.0
+Pillow==11.3.0
+scikit_learn==1.7.1
+scipy==1.16.1
+skimage==0.0
+torch==2.7.1+cu128
+torch_summary==1.4.5
+torchvision==0.22.1+cu128
+tqdm==4.66.5
+xisf==0.9.5
