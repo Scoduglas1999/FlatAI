@@ -35,7 +35,7 @@ However, taking high-quality flat frames can be difficult and time-consuming. **
 The image formation model for flat-fielding is as follows:
 
 <p align="center">
-  <img src="https://latex.codecogs.com/png.latex?I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}" title="I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}" />
+  <img src="https://latex.codecogs.com/svg.latex?I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}" />
 </p>
 
 Where:
@@ -53,7 +53,7 @@ The initial version of this project (now located in the `optical_aberration` dir
 The image formation model for optical aberrations is a convolution:
 
 <p align="center">
-  <img src="https://latex.codecogs.com/png.latex?I_{\text{observed}} = I_{\text{true}} * \text{PSF}" title="I_{\text{observed}} = I_{\text{true}} * \text{PSF}" />
+  <img src="https://latex.codecogs.com/svg.latex?I_{\text{observed}} = I_{\text{true}} * \text{PSF}" />
 </p>
 
 Where:
@@ -156,7 +156,7 @@ The model is then trained to take an "affected" image and reproduce the "perfect
 The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
 
 <p align="center">
-  <img src="https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" title="\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
+  <img src="https://latex.codecogs.com/svg.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
 </p>
 
 Where:
@@ -181,7 +181,7 @@ This model attempts to deconvolve the Point Spread Function (PSF) caused by opti
 The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
 
 <p align="center">
-  <img src="https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" title="\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
+  <img src="https://latex.codecogs.com/svg.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
 </p>
 
 -   &#x1D4C1;<sub>Physics</sub>: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output *I*<sub>pred</sub> is convolved with the original PSF: *I*<sub>reblurred</sub> = *I*<sub>pred</sub> \* *PSF*. The loss is the L1 distance between *I*<sub>reblurred</sub> and the original blurry input *I*<sub>observed</sub>.
