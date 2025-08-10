@@ -7,9 +7,24 @@
 
 This repository contains the code for both approaches, but do note that a significant portion of this project is for personal learning and experimentation.
 
-While looking at the project you may realize that some files seem disjointed, superfluous, or you may notice that there is bad code in some. This is because I have not been culling files as they become unnecessary like I would on a real public project. In the end, I may release the final model once done training, but that day is not today, so browse this repo with caution understanding much of it can seem random at times. 
+While looking at the project you may realize that some files seem disjointed, superfluous, or you may notice that there is bad code in some. This is because I have not been culling files as they become unnecessary like I would on a real public project. In the end, I may release the final model once done training, but that day is not today, so browse this repo with caution understanding much of it can seem random at times.
 
-Training samples will be added in batches as I continue working. I likely will not be uploading each one as they finish, but likely there will be more at least once a day if improvement warrants it. 
+Training samples will be added in batches as I continue working. I likely will not be uploading each one as they finish, but likely there will be more at least once a day if improvement warrants it.
+
+## Table of Contents
+* [The "Flat-Field" Problem in Astrophotography](#the-flat-field-problem-in-astrophotography)
+* [The "Optical Aberration" Problem](#the-optical-aberration-problem)
+* [Project Evolution and Challenges](#project-evolution-and-challenges)
+* [Model Architecture](#model-architecture)
+* [Models and Training](#models-and-training)
+  * [1. Flat-Field Correction Model](#1-flat-field-correction-model)
+  * [2. Optical Aberration (PINN) Model](#2-optical-aberration-pinn-model)
+* [Usage](#usage)
+  * [1. Setup](#1-setup)
+  * [2. Dataset Generation](#2-dataset-generation)
+  * [3. Training](#3-training)
+  * [4. Inference](#4-inference)
+* [Future Work](#future-work)
 
 ## The "Flat-Field" Problem in Astrophotography
 
@@ -17,11 +32,26 @@ A "flat frame" is a calibration image used to correct for imperfections in the o
 
 However, taking high-quality flat frames can be difficult and time-consuming. **FlatAI** aims to solve this by learning the *characteristics* of these artifacts and removing them directly from the science image, eliminating the need for a separate flat frame.
 
+The image formation model for flat-fielding is as follows:
+\[ I_{observed} = (I_{true} \times F_{mult}) + G_{add} \]
+Where:
+- \(I_{observed}\) is the final image captured by the sensor.
+- \(I_{true}\) is the "perfect" image of the astronomical object.
+- \(F_{mult}\) is the multiplicative flat-field, containing artifacts like vignetting and dust motes.
+- \(G_{add}\) is the additive gradient field, containing artifacts like amplifier glow and linear gradients.
+
 ## The "Optical Aberration" Problem
 
 Optical aberrations are distortions in an image caused by the physical properties of the lenses and mirrors in a telescope. Aberrations like coma, astigmatism, and chromatic aberration can deform stars and reduce image sharpness, especially towards the edges of the field of view.
 
 The initial version of this project (now located in the `optical_aberration` directory) was designed as a Physics-Informed Neural Network (PINN) to correct these aberrations. It used Zernike polynomials to mathematically model the aberrations, generate a dataset of "perfect" vs. "aberrated" images, and then train a network to reverse the distortion.
+
+The image formation model for optical aberrations is a convolution:
+\[ I_{observed} = I_{true} * PSF \]
+Where:
+- \(I_{observed}\) is the blurry image captured by the sensor.
+- \(I_{true}\) is the "perfect" sharp image.
+- \(PSF\) is the Point Spread Function, which represents the optical aberration.
 
 ### Project Evolution and Challenges
 
@@ -33,9 +63,15 @@ While the PINN approach for aberration correction showed promise, it encountered
 
 Due to these challenges, the project pivoted to focus on the more constrained, but equally important, problem of flat-field correction.
 
+## Model Architecture
+
+The core of the project is an Attention-based Residual U-Net (`unet_model.py`). This architecture uses residual blocks to prevent vanishing gradients and attention gates to focus on salient features from the skip connections.
+
+![AttentionResUNet Architecture](https://i.imgur.com/L1n7Z3H.png)
+
 ## Models and Training
 
-The core of the project is an Attention-based Residual U-Net (`unet_model.py`). Two separate training workflows are provided, one for each of the project's goals.
+Two separate training workflows are provided, one for each of the project's goals.
 
 ### 1. Flat-Field Correction Model
 
@@ -57,11 +93,14 @@ The model is then trained to take an "affected" image and reproduce the "perfect
 #### Loss Function
 
 The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
-
-*   **L1 Loss:** For pixel-level accuracy.
-*   **LPIPS Loss:** A perceptual loss that encourages the output to be visually similar to the ground truth.
-*   **Style Loss (VGG-based):** A texture-based loss that helps prevent the model from creating unnatural patterns.
-*   **Physics-Consistency Loss:** The model's output is fed back into the forward physics model (i.e., the flat/gradient fields are re-applied). The result is compared to the original input image, ensuring the correction is physically plausible.
+\[ \mathcal{L}_{total} = \lambda_{L1}\mathcal{L}_{L1} + \lambda_{LPIPS}\mathcal{L}_{LPIPS} + \lambda_{Style}\mathcal{L}_{Style} + \lambda_{Physics}\mathcal{L}_{Physics} \]
+Where:
+-   **\(\mathcal{L}_{L1}\):** A pixel-level L1 loss for basic reconstruction accuracy.
+-   **\(\mathcal{L}_{LPIPS}\):** The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
+-   **\(\mathcal{L}_{Style}\):** A VGG-based style loss calculated from the Gram matrix of feature maps. The Gram matrix is defined as:
+    \[ G_{l}(I) = \frac{1}{C_l H_l W_l} F_l(I) F_l(I)^T \]
+    where \(F_l(I)\) is the flattened feature map from layer \(l\) of a VGG network.
+-   **\(\mathcal{L}_{Physics}\):** A physics-consistency loss. The model's output \(I_{pred}\) is fed back into the forward physics model to reconstruct the observed image: \(I_{reconstructed} = (I_{pred} \times F_{mult}) + G_{add}\). The loss is the L1 distance between \(I_{reconstructed}\) and the original \(I_{observed}\).
 
 ### 2. Optical Aberration (PINN) Model
 
@@ -76,10 +115,9 @@ This model attempts to deconvolve the Point Spread Function (PSF) caused by opti
 
 #### Loss Function
 
-The PINN model also uses a multi-part loss function:
-
-*   **L1 Loss, LPIPS Loss, Style Loss:** Similar to the flat-field model, these ensure the de-blurred image is accurate and visually correct.
-*   **Physics-Informed Loss (Re-convolution):** The model's "corrected" (sharpened) output is convolved with the original PSF. This "re-blurred" image is then compared to the original blurry input. This forces the network to learn a deconvolution that is the inverse of the physical blurring process.
+The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
+\[ \mathcal{L}_{total} = \lambda_{L1}\mathcal{L}_{L1} + \lambda_{LPIPS}\mathcal{L}_{LPIPS} + \lambda_{Style}\mathcal{L}_{Style} + \lambda_{Physics}\mathcal{L}_{Physics} \]
+-   **\(\mathcal{L}_{Physics}\):** The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output \(I_{pred}\) is convolved with the original PSF: \(I_{reblurred} = I_{pred} * PSF\). The loss is the L1 distance between \(I_{reblurred}\) and the original blurry input \(I_{observed}\).
 
 ## Usage
 
