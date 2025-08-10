@@ -34,7 +34,9 @@ However, taking high-quality flat frames can be difficult and time-consuming. **
 
 The image formation model for flat-fielding is as follows:
 
-*I*<sub>observed</sub> = (*I*<sub>true</sub> &times; *F*<sub>mult</sub>) + *G*<sub>add</sub>
+<p align="center">
+  <img src="https://latex.codecogs.com/png.latex?I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}" title="I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}" />
+</p>
 
 Where:
 - *I*<sub>observed</sub> is the final image captured by the sensor.
@@ -50,7 +52,9 @@ The initial version of this project (now located in the `optical_aberration` dir
 
 The image formation model for optical aberrations is a convolution:
 
-*I*<sub>observed</sub> = *I*<sub>true</sub> \* *PSF*
+<p align="center">
+  <img src="https://latex.codecogs.com/png.latex?I_{\text{observed}} = I_{\text{true}} * \text{PSF}" title="I_{\text{observed}} = I_{\text{true}} * \text{PSF}" />
+</p>
 
 Where:
 - *I*<sub>observed</sub> is the blurry image captured by the sensor.
@@ -151,13 +155,15 @@ The model is then trained to take an "affected" image and reproduce the "perfect
 
 The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
 
-&mathcal;L;<sub>total</sub> = &lambda;<sub>L1</sub>&mathcal;L;<sub>L1</sub> + &lambda;<sub>LPIPS</sub>&mathcal;L;<sub>LPIPS</sub> + &lambda;<sub>Style</sub>&mathcal;L;<sub>Style</sub> + &lambda;<sub>Physics</sub>&mathcal;L;<sub>Physics</sub>
+<p align="center">
+  <img src="https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" title="\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
+</p>
 
 Where:
-- **&mathcal;L;<sub>L1</sub>**: A pixel-level L1 loss for basic reconstruction accuracy.
-- **&mathcal;L;<sub>LPIPS</sub>**: The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
-- **&mathcal;L;<sub>Style</sub>**: A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
-- **&mathcal;L;<sub>Physics</sub>**: A physics-consistency loss. The model's output *I*<sub>pred</sub> is fed back into the forward physics model to reconstruct the observed image: *I*<sub>reconstructed</sub> = (*I*<sub>pred</sub> &times; *F*<sub>mult</sub>) + *G*<sub>add</sub>. The loss is the L1 distance between *I*<sub>reconstructed</sub> and the original *I*<sub>observed</sub>.
+- &#x1D4C1;<sub>L1</sub>: A pixel-level L1 loss for basic reconstruction accuracy.
+- &#x1D4C1;<sub>LPIPS</sub>: The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
+- &#x1D4C1;<sub>Style</sub>: A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
+- &#x1D4C1;<sub>Physics</sub>: A physics-consistency loss. The model's output *I*<sub>pred</sub> is fed back into the forward physics model to reconstruct the observed image: *I*<sub>reconstructed</sub> = (*I*<sub>pred</sub> &times; *F*<sub>mult</sub>) + *G*<sub>add</sub>. The loss is the L1 distance between *I*<sub>reconstructed</sub> and the original *I*<sub>observed</sub>.
 
 ### 2. Optical Aberration (PINN) Model
 
@@ -174,9 +180,11 @@ This model attempts to deconvolve the Point Spread Function (PSF) caused by opti
 
 The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
 
-&mathcal;L;<sub>total</sub> = &lambda;<sub>L1</sub>&mathcal;L;<sub>L1</sub> + &lambda;<sub>LPIPS</sub>&mathcal;L;<sub>LPIPS</sub> + &lambda;<sub>Style</sub>&mathcal;L;<sub>Style</sub> + &lambda;<sub>Physics</sub>&mathcal;L;<sub>Physics</sub>
+<p align="center">
+  <img src="https://latex.codecogs.com/png.latex?\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" title="\mathcal{L}_{\text{total}} = \lambda_{\text{L1}}\mathcal{L}_{\text{L1}} + \lambda_{\text{LPIPS}}\mathcal{L}_{\text{LPIPS}} + \lambda_{\text{Style}}\mathcal{L}_{\text{Style}} + \lambda_{\text{Physics}}\mathcal{L}_{\text{Physics}}" />
+</p>
 
--   **&mathcal;L;<sub>Physics</sub>**: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output *I*<sub>pred</sub> is convolved with the original PSF: *I*<sub>reblurred</sub> = *I*<sub>pred</sub> \* *PSF*. The loss is the L1 distance between *I*<sub>reblurred</sub> and the original blurry input *I*<sub>observed</sub>.
+-   &#x1D4C1;<sub>Physics</sub>: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output *I*<sub>pred</sub> is convolved with the original PSF: *I*<sub>reblurred</sub> = *I*<sub>pred</sub> \* *PSF*. The loss is the L1 distance between *I*<sub>reblurred</sub> and the original blurry input *I*<sub>observed</sub>.
 
 ## Usage
 
