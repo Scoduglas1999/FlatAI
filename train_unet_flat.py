@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import lpips
@@ -134,6 +135,11 @@ WARMUP_PHYS_STEPS = 500
 WARMUP_LPIPS_STEPS = 1000
 WARMUP_STYLE_STEPS = 5000
 
+# Scheduler settings
+SCHEDULER_PATIENCE = 10
+SCHEDULER_FACTOR = 0.5
+SCHEDULER_MIN_LR = 1e-7
+
 
 def save_sample_images(epoch, affected, sharp, corrected, save_dir):
     affected = (affected[0].cpu().detach() + 1) / 2
@@ -166,11 +172,12 @@ def forward_flat_model(y_pred_norm: torch.Tensor, F_mul: torch.Tensor, G_add: to
     return obs01 * 2.0 - 1.0
 
 
-def save_checkpoint(epoch, model, optimizer, best_loss, filename=MODEL_CHECKPOINT_PATH, train_losses=None, val_losses=None):
+def save_checkpoint(epoch, model, optimizer, scheduler, best_loss, filename=MODEL_CHECKPOINT_PATH, train_losses=None, val_losses=None):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'loss': best_loss,
         'train_losses': train_losses or [],
         'val_losses': val_losses or [],
@@ -221,6 +228,12 @@ def main():
     lpips_loss_fn = lpips.LPIPS(net='alex', spatial=False).to(device)
     style_criterion = StyleLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
+    scheduler = ReduceLROnPlateau(
+        optimizer, 'min',
+        patience=SCHEDULER_PATIENCE,
+        factor=SCHEDULER_FACTOR,
+        min_lr=SCHEDULER_MIN_LR
+    )
 
     start_epoch = 0
     train_losses, val_losses = [], []
@@ -238,6 +251,8 @@ def main():
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             train_losses = checkpoint.get('train_losses', [])
             val_losses = checkpoint.get('val_losses', [])
@@ -253,7 +268,8 @@ def main():
         # Train
         model.train()
         running = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
+        current_lr = optimizer.param_groups[0]['lr']
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train] LR: {current_lr:.2e}")
         max_train_steps = int(os.environ.get('MAX_TRAIN_STEPS', '0'))
         step_count = 0
         for affected, sharp, flat, grad in pbar:
@@ -348,11 +364,14 @@ def main():
         val_losses.append(avg_val)
         print(f"Epoch {epoch+1}: Train {avg_train:.6f}, Val {avg_val:.6f}")
 
+        # Update LR
+        scheduler.step(avg_val)
+
         # Checkpoint
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             print(f"  -> New best val {best_val_loss:.6f}; saving checkpoint")
-            save_checkpoint(epoch, model, optimizer, best_val_loss, train_losses=train_losses, val_losses=val_losses)
+            save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, train_losses=train_losses, val_losses=val_losses)
 
     print(f"Training complete. Saving final model to {FINAL_MODEL_SAVE_PATH}")
     torch.save(model.state_dict(), FINAL_MODEL_SAVE_PATH)
