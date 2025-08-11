@@ -130,7 +130,10 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
     
     if is_linear:
         status_callback("Using LINEAR mode - global normalization.")
-        global_min, global_max = np.percentile(image_2d, 0.1), np.percentile(image_2d, 99.9)
+        # Use true minimum to preserve faint background and high percentile for highlights
+        global_min, global_max = float(np.min(image_2d)), float(np.percentile(image_2d, 99.99))
+        if not np.isfinite(global_max) or global_max <= global_min:
+            global_min, global_max = float(np.min(image_2d)), float(np.max(image_2d))
     else:
         status_callback("Using NON-LINEAR mode - per-tile normalization.")
         global_min, global_max = None, None
@@ -174,6 +177,8 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
                 input_tensor = input_tensor.to(device)
                 with torch.no_grad():
                     corrected_tensor = model(input_tensor)
+                    # Keep output within the training domain [-1,1] to prevent downstream clipping
+                    corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
                 corrected_padded_tile = postprocess_tile(corrected_tensor, norm_range)
             
             corrected_tile = corrected_padded_tile[:tile_h, :tile_w]
@@ -184,6 +189,60 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
 
     weight_map[weight_map == 0] = 1.0
     corrected_image /= weight_map
+
+    # Optional conservative blending to preserve structures and only correct artifacts
+    def _gaussian_kernel1d(sigma: float, radius: int | None = None) -> np.ndarray:
+        if sigma <= 0:
+            return np.array([1.0], dtype=np.float32)
+        if radius is None:
+            radius = max(1, int(3.0 * sigma))
+        x = np.arange(-radius, radius + 1, dtype=np.float32)
+        k = np.exp(-(x * x) / (2.0 * sigma * sigma))
+        k /= np.sum(k)
+        return k.astype(np.float32)
+
+    def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+        if sigma <= 0:
+            return image
+        kernel = _gaussian_kernel1d(sigma)
+        pad_w = len(kernel) // 2
+        tmp = np.pad(image, ((0, 0), (pad_w, pad_w)), mode='reflect')
+        tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), 1, tmp)
+        tmp = tmp[:, pad_w:-pad_w]
+        tmp = np.pad(tmp, ((pad_w, pad_w), (0, 0)), mode='reflect')
+        out = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), 0, tmp)
+        out = out[pad_w:-pad_w, :]
+        return out.astype(np.float32)
+
+    def _gradient_magnitude(img01: np.ndarray) -> np.ndarray:
+        gy, gx = np.gradient(img01.astype(np.float32))
+        return np.sqrt(gx * gx + gy * gy).astype(np.float32)
+
+    app_ref = getattr(status_callback, '__self__', None)
+    if app_ref is not None and hasattr(app_ref, 'conservative_var') and app_ref.conservative_var.get():
+        # Map to [0,1] and compute difference mask
+        p_lo, p_hi = np.percentile(image_2d, [0.5, 99.5])
+        if not np.isfinite(p_lo) or not np.isfinite(p_hi) or p_hi <= p_lo:
+            p_lo, p_hi = float(np.min(image_2d)), float(np.max(image_2d))
+        orig01 = np.clip((image_2d - p_lo) / (p_hi - p_lo + 1e-6), 0.0, 1.0)
+        corr01 = np.clip((corrected_image - p_lo) / (p_hi - p_lo + 1e-6), 0.0, 1.0)
+
+        diff = corr01 - orig01
+        aggr = float(np.clip(app_ref.conservative_strength.get(), 0.0, 1.0))
+        blur_sigma = 3.0 + 7.0 * aggr
+        m0 = _gaussian_blur(np.abs(diff), sigma=blur_sigma)
+
+        g = _gradient_magnitude(_gaussian_blur(orig01, sigma=1.0))
+        g_norm = g / (np.percentile(g, 99.0) + 1e-6)
+        g_norm = np.clip(g_norm, 0.0, 1.0)
+        power = 0.5 + 1.5 * aggr
+        mask = m0 * np.power(1.0 - g_norm, power)
+        t = np.percentile(m0, 75.0 + 20.0 * aggr)
+        if np.isfinite(t) and t > 0:
+            mask = np.where(m0 >= t, mask, mask * 0.2)
+        mask = np.clip(mask * (0.5 + 0.5 * aggr), 0.0, 1.0).astype(np.float32)
+        corrected_image = (image_2d.astype(np.float32) + mask * (corrected_image.astype(np.float32) - image_2d.astype(np.float32))).astype(np.float32)
+
     return corrected_image
 
 def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance, force_mode_str, overwrite):
@@ -273,27 +332,9 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
                 xisf_image = np.transpose(xisf_image, (1, 2, 0))
             xisf_image = np.ascontiguousarray(xisf_image)
 
-            # If saving float data, scale to [0,1] so that it matches XISF's
-            # implicit bounds for float sample formats. The upstream writer
-            # sets bounds="0:1" for Float types unconditionally.
+            # Preserve linear float data without percentile remapping.
+            # Just ensure float32 dtype and contiguous memory.
             if np.issubdtype(xisf_image.dtype, np.floating):
-                # For float XISF, the library writes bounds="0:1". To mimic how
-                # our FITS path represents data visually when the source was
-                # integer (e.g., UInt16), normalize by the integer type range
-                # instead of the image min/max. This keeps mid-tones comparable
-                # and avoids clipping highlights.
-                if np.issubdtype(original_dtype, np.integer):
-                    iinfo = np.iinfo(original_dtype)
-                    scale = float(iinfo.max - iinfo.min)
-                    if scale > 0:
-                        xisf_image = (xisf_image - float(iinfo.min)) / scale
-                    else:
-                        xisf_image = np.zeros_like(xisf_image)
-                    xisf_image = np.clip(xisf_image, 0.0, 1.0)
-                else:
-                    # If the pipeline was already float, assume it is either in
-                    # [0,1] or a linear range; clamp softly to [0,1].
-                    xisf_image = np.clip(xisf_image, 0.0, 1.0)
                 xisf_image = xisf_image.astype(np.float32, copy=False)
 
             # Build FITSKeywords dict in the structure expected by xisf.XISF.write
@@ -335,7 +376,18 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
             )
 
         else:  # Default to FITS
-            fits.writeto(output_path, final_image, header=original_header, overwrite=True)
+            # Sanitize legacy scaling keywords so float data isn't re-scaled on read
+            def _sanitize_header(header):
+                if header is None:
+                    return None
+                hdr = header.copy()
+                for key in ['BSCALE', 'BZERO', 'BLANK', 'DATAMIN', 'DATAMAX', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2']:
+                    if key in hdr:
+                        del hdr[key]
+                return hdr
+
+            clean_header = _sanitize_header(original_header)
+            fits.writeto(output_path, final_image.astype(np.float32, copy=False), header=clean_header, overwrite=True)
 
         end_time = time.time()
         status_callback(f"Correction complete in {end_time - start_time:.2f} seconds.")
@@ -367,6 +419,8 @@ class FlatAICorrectorApp(ctk.CTk):
         self.save_float32_var = ctk.BooleanVar(value=True)
         self.overwrite_var = ctk.BooleanVar(value=False)
         self.is_processing = False
+        self.conservative_var = ctk.BooleanVar(value=True)
+        self.conservative_strength = ctk.DoubleVar(value=0.7)
 
         self.setup_ui()
         self.update_run_button_state()
@@ -410,6 +464,9 @@ class FlatAICorrectorApp(ctk.CTk):
         ctk.CTkCheckBox(options_frame, text="Save as float32", variable=self.save_float32_var).pack(side="left", padx=20)
         self.overwrite_checkbox = ctk.CTkCheckBox(options_frame, text="Overwrite input file", variable=self.overwrite_var, command=self.on_overwrite_toggle)
         self.overwrite_checkbox.pack(side="left", padx=5)
+        ctk.CTkCheckBox(options_frame, text="Surgical blend", variable=self.conservative_var).pack(side="left", padx=20)
+        ctk.CTkLabel(options_frame, text="Aggressiveness").pack(side="left", padx=(10, 5))
+        ctk.CTkSlider(options_frame, from_=0.0, to=1.0, number_of_steps=100, width=160, variable=self.conservative_strength).pack(side="left", padx=5)
 
         processing_frame = ctk.CTkFrame(self)
         processing_frame.grid(row=4, column=0, padx=20, pady=10, sticky="nsew")
