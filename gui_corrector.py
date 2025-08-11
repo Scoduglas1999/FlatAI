@@ -1,4 +1,4 @@
-# gui_corrector.py - Graphical User Interface for PSFNet AI Image Corrector
+# gui_corrector.py - FlatAI: Modern Flat-Field Correction Interface
 
 # =============================================================================
 # --- CONFIGURATION FOR TESTING ---
@@ -29,7 +29,7 @@ try:
 except ImportError:
     Image = None
 
-# --- NEW: Import the correct model architecture ---
+# --- Import the correct model architecture ---
 from unet_model import AttentionResUNet
 
 # Default model paths
@@ -37,7 +37,7 @@ PREFERRED_MODEL = "./unet_flat_model_final.pth"
 FALLBACK_MODEL = "./unet_flat_checkpoint.pth"
 
 # =============================================================================
-# --- 1. BACKEND PROCESSING LOGIC (copied from run_correction.py) ---
+# --- BACKEND PROCESSING LOGIC (keeping existing functions) ---
 # =============================================================================
 
 # Correct UNet Model Definition (matches the trained model)
@@ -509,7 +509,7 @@ def pick_model_path(user_path: str | None) -> str:
     raise FileNotFoundError("No model file selected and no default model found.")
 
 
-def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance, force_mode):
+def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance, force_mode, overwrite):
     """
     Core image processing logic. Now handles both grayscale and RGB images with proper data type preservation.
     """
@@ -610,7 +610,17 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         if image_path.lower().endswith(('.fits', '.fit')):
             with fits.open(image_path) as hdul:
                 original_header = hdul[0].header
-        
+
+        # If overwriting input, create a safety backup alongside
+        if overwrite and os.path.abspath(output_path) == os.path.abspath(image_path):
+            backup_path = output_path + ".bak"
+            try:
+                if os.path.exists(output_path):
+                    os.replace(output_path, backup_path)
+                    status_callback(f"Backup created: {backup_path}")
+            except Exception as be:
+                status_callback(f"Backup warning: {be}")
+
         fits.writeto(output_path, final_image, header=original_header, overwrite=True)
         
         end_time = time.time()
@@ -631,13 +641,28 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
 # --- 2. GUI FRONTEND LOGIC ---
 # =============================================================================
 
-class CorrectorApp(tk.Tk):
+class FlatAICorrectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PSFNet AI Image Corrector")
-        self.geometry("680x520")
+        self.title("FlatAI - Flat-Field Correction")
+        self.geometry("800x700")
         self.resizable(True, True)
-
+        
+        # Configure modern styling
+        self.configure(bg='#f0f0f0')
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Configure colors for modern look
+        style.configure('Title.TLabel', font=('Segoe UI', 20, 'bold'), foreground='#2c3e50')
+        style.configure('Subtitle.TLabel', font=('Segoe UI', 12), foreground='#34495e')
+        style.configure('Info.TLabel', font=('Segoe UI', 10), foreground='#7f8c8d')
+        style.configure('Success.TLabel', font=('Segoe UI', 10, 'bold'), foreground='#27ae60')
+        style.configure('Warning.TLabel', font=('Segoe UI', 10, 'bold'), foreground='#e67e22')
+        
+        # Configure accent button style
+        style.configure('Accent.TButton', font=('Segoe UI', 12, 'bold'), padding=(20, 10))
+        
         # Variables
         self.image_path = tk.StringVar()
         self.model_path = tk.StringVar()
@@ -646,90 +671,151 @@ class CorrectorApp(tk.Tk):
         self.force_mode_var = tk.StringVar(value="auto")  # auto|linear|nonlinear
 
         self.save_float32_var = tk.BooleanVar(value=True)  # default to float32 to avoid banding
+        self.overwrite_var = tk.BooleanVar(value=False)    # overwrite input file (destructive)
 
         self.setup_ui()
         self.update_run_button_state()
 
     def setup_ui(self):
-        """Set up the user interface."""
-        # Main frame
-        main_frame = ttk.Frame(self, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        """Set up the modern, purpose-focused user interface."""
+        # Main container with padding
+        main_container = ttk.Frame(self, padding="20")
+        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Configure grid weights
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        main_container.columnconfigure(1, weight=1)
 
-        # Title
-        title_label = ttk.Label(main_frame, text="PSFNet AI Image Corrector", 
-                               font=("Arial", 16, "bold"))
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        # ===== HEADER SECTION =====
+        header_frame = ttk.Frame(main_container)
+        header_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 20))
+        
+        # Title and subtitle
+        title_label = ttk.Label(header_frame, text="FlatAI", style='Title.TLabel')
+        title_label.grid(row=0, column=0, sticky=tk.W)
+        
+        subtitle_label = ttk.Label(header_frame, text="Advanced Flat-Field Correction", style='Subtitle.TLabel')
+        subtitle_label.grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        
+        # Purpose description
+        purpose_text = "Remove dust motes, vignetting, and uneven illumination from astronomical images using AI"
+        purpose_label = ttk.Label(header_frame, text=purpose_text, style='Info.TLabel', wraplength=600)
+        purpose_label.grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+
+        # ===== INPUT SECTION =====
+        input_frame = ttk.LabelFrame(main_container, text="Input Configuration", padding="15")
+        input_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
+        input_frame.columnconfigure(1, weight=1)
 
         # Input Image Selection
-        ttk.Label(main_frame, text="Input Image:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(main_frame, textvariable=self.image_path, width=50).grid(row=1, column=1, 
-                                                                          sticky=(tk.W, tk.E), 
-                                                                          padx=5, pady=5)
-        ttk.Button(main_frame, text="Browse...", 
-                  command=self.browse_input_image).grid(row=1, column=2, pady=5)
+        ttk.Label(input_frame, text="Input Image:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(input_frame, text="Select your astronomical image (FITS, XISF, JPG, PNG)", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        
+        input_entry_frame = ttk.Frame(input_frame)
+        input_entry_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        input_entry_frame.columnconfigure(0, weight=1)
+        
+        self.input_entry = ttk.Entry(input_entry_frame, textvariable=self.image_path, font=('Segoe UI', 10))
+        self.input_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
+        ttk.Button(input_entry_frame, text="Browse...", command=self.browse_input_image).grid(row=0, column=1)
 
-        # Model File Selection (optional; will auto-pick otherwise)
-        ttk.Label(main_frame, text="Model File (optional):").grid(row=2, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(main_frame, textvariable=self.model_path, width=50).grid(row=2, column=1, 
-                                                                          sticky=(tk.W, tk.E), 
-                                                                          padx=5, pady=5)
-        ttk.Button(main_frame, text="Browse...", 
-                  command=self.browse_model_file).grid(row=2, column=2, pady=5)
+        # Model File Selection
+        ttk.Label(input_frame, text="Model File (Optional):", style='Subtitle.TLabel').grid(row=3, column=0, sticky=tk.W, pady=(10, 5))
+        ttk.Label(input_frame, text="AI model for correction. Auto-detects if not specified.", style='Info.TLabel').grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
+        
+        model_entry_frame = ttk.Frame(input_frame)
+        model_entry_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        model_entry_frame.columnconfigure(0, weight=1)
+        
+        self.model_entry = ttk.Entry(model_entry_frame, textvariable=self.model_path, font=('Segoe UI', 10))
+        self.model_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
+        ttk.Button(model_entry_frame, text="Browse...", command=self.browse_model_file).grid(row=0, column=1)
+
+        # ===== OUTPUT SECTION =====
+        output_frame = ttk.LabelFrame(main_container, text="Output Configuration", padding="15")
+        output_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
+        output_frame.columnconfigure(1, weight=1)
 
         # Output Path Selection
-        ttk.Label(main_frame, text="Output Path:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(main_frame, textvariable=self.output_path, width=50).grid(row=3, column=1, 
-                                                                           sticky=(tk.W, tk.E), 
-                                                                           padx=5, pady=5)
-        ttk.Button(main_frame, text="Browse...", 
-                  command=self.browse_output_path).grid(row=3, column=2, pady=5)
+        ttk.Label(output_frame, text="Output Path:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(output_frame, text="Where to save the corrected image", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        
+        output_entry_frame = ttk.Frame(output_frame)
+        output_entry_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        output_entry_frame.columnconfigure(0, weight=1)
+        
+        self.output_entry = ttk.Entry(output_entry_frame, textvariable=self.output_path, font=('Segoe UI', 10))
+        self.output_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
+        self.output_browse_btn = ttk.Button(output_entry_frame, text="Browse...", command=self.browse_output_path)
+        self.output_browse_btn.grid(row=0, column=1)
 
-        # Mode selector
-        ttk.Label(main_frame, text="Processing Mode:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        mode_frame = ttk.Frame(main_frame)
-        mode_frame.grid(row=4, column=1, sticky=tk.W)
-        ttk.Radiobutton(mode_frame, text="Auto", value="auto", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(mode_frame, text="Linear", value="linear", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(mode_frame, text="Non-linear", value="nonlinear", variable=self.force_mode_var).pack(side=tk.LEFT, padx=5)
+        # ===== PROCESSING OPTIONS SECTION =====
+        options_frame = ttk.LabelFrame(main_container, text="Processing Options", padding="15")
+        options_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
 
-        # Output options
-        opts_frame = ttk.Frame(main_frame)
-        opts_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
-        ttk.Checkbutton(opts_frame, text="Save FITS as float32 (recommended to avoid banding)",
-                        variable=self.save_float32_var).pack(side=tk.LEFT, padx=5)
+        # Processing Mode
+        mode_frame = ttk.Frame(options_frame)
+        mode_frame.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        
+        ttk.Label(mode_frame, text="Processing Mode:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(mode_frame, text="How to handle image normalization", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        
+        mode_buttons_frame = ttk.Frame(mode_frame)
+        mode_buttons_frame.grid(row=2, column=0, sticky=tk.W)
+        
+        ttk.Radiobutton(mode_buttons_frame, text="Auto-detect (Recommended)", value="auto", 
+                       variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(mode_buttons_frame, text="Force Linear", value="linear", 
+                       variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(mode_buttons_frame, text="Force Non-linear", value="nonlinear", 
+                       variable=self.force_mode_var).pack(side=tk.LEFT)
+
+        # Output Options
+        output_options_frame = ttk.Frame(options_frame)
+        output_options_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        
+        ttk.Checkbutton(output_options_frame, text="Save as float32 (prevents banding artifacts)", 
+                       variable=self.save_float32_var).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Checkbutton(output_options_frame, text="Overwrite input file", 
+                       variable=self.overwrite_var, command=self.on_overwrite_toggle).pack(side=tk.LEFT)
+
+        # ===== PROCESSING SECTION =====
+        processing_frame = ttk.LabelFrame(main_container, text="Processing", padding="15")
+        processing_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
+        processing_frame.columnconfigure(1, weight=1)
 
         # Run Button
-        self.run_button = ttk.Button(main_frame, text="🚀 Run Correction", 
-                                    command=self.start_correction)
-        self.run_button.grid(row=6, column=0, columnspan=3, pady=20)
+        self.run_button = ttk.Button(processing_frame, text="🚀 Start Flat-Field Correction", 
+                                    command=self.start_correction, style='Accent.TButton')
+        self.run_button.grid(row=0, column=0, columnspan=3, pady=(0, 15))
 
         # Progress Bar
-        ttk.Label(main_frame, text="Progress:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        ttk.Label(processing_frame, text="Progress:", style='Subtitle.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, 
-                                          maximum=100, length=480)
-        self.progress_bar.grid(row=7, column=1, columnspan=2, sticky=(tk.W, tk.E), 
-                              padx=5, pady=5)
+        self.progress_bar = ttk.Progressbar(processing_frame, variable=self.progress_var, 
+                                          maximum=100, length=600, mode='determinate')
+        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
 
-        # Status Label
-        ttk.Label(main_frame, text="Status:").grid(row=8, column=0, sticky=(tk.W, tk.N), pady=5)
-        self.status_var = tk.StringVar(value="Ready. Please select files and click 'Run Correction'.")
-        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
-                                     wraplength=480, justify=tk.LEFT)
-        self.status_label.grid(row=8, column=1, columnspan=2, sticky=(tk.W, tk.E), 
-                              padx=5, pady=5)
+        # Status Display
+        ttk.Label(processing_frame, text="Status:", style='Subtitle.TLabel').grid(row=3, column=0, sticky=(tk.W, tk.N), pady=(0, 5))
+        self.status_var = tk.StringVar(value="Ready to process. Select an input image and click 'Start Flat-Field Correction'.")
+        self.status_label = ttk.Label(processing_frame, textvariable=self.status_var, 
+                                     wraplength=600, justify=tk.LEFT, style='Info.TLabel')
+        self.status_label.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
 
+        # ===== FOOTER SECTION =====
+        footer_frame = ttk.Frame(main_container)
+        footer_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(10, 0))
+        
         # Device Info
         device = "CUDA" if torch.cuda.is_available() else "CPU"
-        device_label = ttk.Label(main_frame, text=f"Processing Device: {device}", 
-                                font=("Arial", 9))
-        device_label.grid(row=9, column=0, columnspan=3, pady=(10, 0))
+        device_label = ttk.Label(footer_frame, text=f"Processing Device: {device}", style='Info.TLabel')
+        device_label.pack(side=tk.LEFT)
+        
+        # Version info
+        version_label = ttk.Label(footer_frame, text="FlatAI v1.0 - 40M Parameter U-Net", style='Info.TLabel')
+        version_label.pack(side=tk.RIGHT)
 
     def browse_input_image(self):
         """Browse for input image file."""
@@ -765,15 +851,19 @@ class CorrectorApp(tk.Tk):
 
     def update_run_button_state(self):
         """Enable/disable run button based on file selections."""
-        if (self.image_path.get() and self.model_path.get() and 
-            self.output_path.get() and not self.is_processing):
+        has_image = bool(self.image_path.get())
+        has_model = bool(self.model_path.get())
+        has_output = bool(self.output_path.get())
+        if (has_image and has_model and ((self.overwrite_var.get()) or has_output) and not self.is_processing):
             self.run_button.config(state='normal')
         else:
             self.run_button.config(state='disabled')
 
     def start_correction(self):
-        self.update_run_button_state()
+        self.is_processing = True
+        self.run_button.config(text="⏳ Processing...", state='disabled')
         self.progress_bar['value'] = 0
+        self.status_var.set("Starting flat-field correction...")
         
         # Start the processing in a separate thread to keep the GUI responsive
         thread = threading.Thread(
@@ -786,15 +876,29 @@ class CorrectorApp(tk.Tk):
         """Wrapper to call the backend logic from a thread."""
         mode = self.force_mode_var.get()
         force_mode = None if mode == "auto" else (True if mode == "linear" else False)
+        # Determine output path (overwrite uses input path)
+        out_path = self.image_path.get() if self.overwrite_var.get() else self.output_path.get()
         run_correction_logic(
             self.image_path.get(),
             self.model_path.get(),
-            self.output_path.get(),
+            out_path,
             self.update_progress,
             self.update_status,
             self,  # Pass the app instance itself
             force_mode,
+            self.overwrite_var.get(),
         )
+
+    def on_overwrite_toggle(self):
+        """Enable/disable output path widgets when overwrite is toggled."""
+        overwrite = self.overwrite_var.get()
+        state = 'disabled' if overwrite else 'normal'
+        self.output_entry.config(state=state)
+        self.output_browse_btn.config(state=state)
+        # If overwriting, mirror output path to input for display clarity
+        if overwrite and self.image_path.get():
+            self.output_path.set(self.image_path.get())
+        self.update_run_button_state()
 
     def update_progress(self, value):
         """Updates the progress bar from any thread."""
@@ -807,7 +911,7 @@ class CorrectorApp(tk.Tk):
     def reset_ui(self):
         """Reset UI after processing is complete."""
         self.is_processing = False
-        self.run_button.config(text="🚀 Run Correction")
+        self.run_button.config(text="🚀 Start Flat-Field Correction")
         self.update_run_button_state()
 
 # =============================================================================
@@ -815,7 +919,7 @@ class CorrectorApp(tk.Tk):
 # =============================================================================
 
 def main():
-    app = CorrectorApp()
+    app = FlatAICorrectorApp()
     app.mainloop()
 
 if __name__ == '__main__':

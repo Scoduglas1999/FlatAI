@@ -1,5 +1,6 @@
 import os
 import random
+import argparse
 import numpy as np
 import torch
 import matplotlib
@@ -97,9 +98,30 @@ def visualize_case(tag: str, gt01: np.ndarray, F_map: torch.Tensor, G_map: torch
 
 
 def main():
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    parser = argparse.ArgumentParser(description="Generate demo flat-field artifacts")
+    parser.add_argument("--seed", type=str, default="random",
+                        help="Seed for RNG: integer, 'random' for a random seed, or 'none' to leave RNG unseeded")
+    args = parser.parse_args()
+
+    # Seeding policy
+    seed_arg = args.seed.lower() if isinstance(args.seed, str) else args.seed
+    if seed_arg == "random":
+        seed_val = int.from_bytes(os.urandom(8), "little")
+        print(f"Using random seed: {seed_val}")
+        random.seed(seed_val)
+        np.random.seed(seed_val % (2**32 - 1))
+        torch.manual_seed(seed_val % (2**31 - 1))
+    elif seed_arg == "none":
+        print("Not setting seeds (non-deterministic run)")
+    else:
+        try:
+            seed_val = int(args.seed)
+            print(f"Using fixed seed: {seed_val}")
+            random.seed(seed_val)
+            np.random.seed(seed_val % (2**32 - 1))
+            torch.manual_seed(seed_val % (2**31 - 1))
+        except Exception:
+            print("Unrecognized seed value; proceeding without explicit seeding")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     gt01 = load_any_patch()
@@ -114,9 +136,24 @@ def main():
     F_vig_b = generate_vignetting_field(h, w, strength=+0.4, order=3.0, center_jitter=0.0, device=device)
     visualize_case("vignetting_bright", gt01, F_vig_b / (F_vig_b.mean() + 1e-8), G_zero, device)
 
-    # Dust motes (strong, mixed rings/discs)
-    F_dust_soft = generate_dust_field(h, w, num_motes=6, device=device, difficulty=0.5)
-    F_dust_strong = generate_dust_field(h, w, num_motes=10, device=device, difficulty=1.0)
+    # Dust motes (dominant common donuts, thicker rings, smaller fuzzy centers)
+    override = {
+        'thickness_range': (0.35, 0.65),
+        'center_rel_range': (0.12, 0.35),
+        'center_scale_range': (0.45, 0.8),
+        'edge_softness_scale': (1.6, 2.6),
+        'rough_amp_scale': 1.0,
+    }
+    F_dust_soft = generate_dust_field(
+        h, w, num_motes=6, device=device, difficulty=0.5,
+        mote_weights=(0.85, 0.12, 0.02, 0.01),
+        common_params_override=override,
+    )
+    F_dust_strong = generate_dust_field(
+        h, w, num_motes=10, device=device, difficulty=1.0,
+        mote_weights=(0.85, 0.10, 0.03, 0.02),
+        common_params_override=override,
+    )
     visualize_case("dust_motes_soft", gt01, F_dust_soft / (F_dust_soft.mean() + 1e-8), G_zero, device)
     visualize_case("dust_motes_strong", gt01, F_dust_strong / (F_dust_strong.mean() + 1e-8), G_zero, device)
 

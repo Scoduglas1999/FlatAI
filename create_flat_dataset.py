@@ -213,6 +213,41 @@ def _donut_mask_jittered(h: int, w: int, cx: float, cy: float,
     return torch.clamp(outer - inner, 0.0, 1.0)
 
 
+def _common_donut_mote(h: int, w: int, cx: float, cy: float,
+                       r0: float, thickness: float, edge: float,
+                       rough_amp: float, depth: float,
+                       center_rel: float, center_scale: float,
+                       device: torch.device) -> torch.Tensor:
+    """
+    Generate a typical dust mote donut: a darker soft ring with a slightly
+    lighter interior. Kept circular with modest boundary roughness.
+
+    Returns multiplicative field contribution in [0.05, 1.0+]. Will be clamped later.
+    """
+    rr = _radial_distance(h, w, cx, cy, device)
+
+    # Boundary jitter (low-frequency) to avoid perfect ring
+    jitter = _make_lowfreq_noise(h, w, scale=48, device=device) * rough_amp
+    rr_j = rr * (1.0 + jitter)
+
+    sigma_ring = max(1e-4, thickness / 2.355)
+    ring = torch.exp(-0.5 * ((rr_j - r0) / (sigma_ring + 1e-6)) ** 2)
+
+    # Slightly soften edges
+    ring = ring * _softstep(r0 + thickness - rr_j, edge)
+    ring = ring * _softstep(rr_j - (r0 - thickness), edge)
+
+    # Center dimming (weaker than ring): keep center fuzzy but not as dark as ring
+    sigma_center = max(1e-4, r0 * center_rel)
+    center = torch.exp(-0.5 * (rr / (sigma_center + 1e-6)) ** 2)
+    center_depth = depth * center_scale
+
+    # Attenuation profile: dark thick ring and softer center dimming
+    mote = 1.0 - depth * ring - center_depth * center
+    mote = torch.clamp(mote, 0.05, 1.05)
+    return mote
+
+
 def _irregular_disc_mask(h: int, w: int, cx: float, cy: float, a: float, b: float,
                          theta: float, edge: float, rough_amp: float, device: torch.device) -> torch.Tensor:
     yy, xx = make_meshgrid(h, w, device)
@@ -255,7 +290,15 @@ def _soft_ring_mask(h: int, w: int, cy: float, cx: float, r_inner: float, r_oute
     return torch.clamp(outer - inner, 0.0, 1.0)
 
 
-def generate_dust_field(h: int, w: int, num_motes: int, device: torch.device, difficulty: float) -> torch.Tensor:
+def generate_dust_field(
+    h: int,
+    w: int,
+    num_motes: int,
+    device: torch.device,
+    difficulty: float,
+    mote_weights: tuple | list | None = None,
+    common_params_override: dict | None = None,
+) -> torch.Tensor:
     """
     Strong, realistic dust occlusions (rings and discs) as multiplicative field.
     - Elliptical, rotated shapes with rough edges
@@ -274,10 +317,42 @@ def generate_dust_field(h: int, w: int, num_motes: int, device: torch.device, di
         interior_noise = _make_lowfreq_noise(h, w, scale=56, device=device)
         interior = (interior_noise * 0.5 + 0.5)
 
-        mote_type = random.choices(["disc", "ring", "multi"], weights=[0.55, 0.35, 0.10])[0]
+        # Favor common donut motes; allow external override for demos/tests
+        if mote_weights is None:
+            weights = [0.65, 0.18, 0.12, 0.05]
+        else:
+            # normalize and validate
+            weights = list(mote_weights)
+            if len(weights) != 4:
+                raise ValueError("mote_weights must be a sequence of 4 numbers: (common, disc, ring, multi)")
+        mote_type = random.choices(["common", "disc", "ring", "multi"], weights=weights)[0]
         very_dark = random.random() < (0.30 + 0.35 * difficulty)
 
-        if mote_type == "disc":
+        if mote_type == "common":
+            # Typical donut: thicker ring, smaller center, fuzzy but not flat interior
+            tr = (0.28, 0.55)
+            cr = (0.18, 0.45)
+            cs = (0.35, 0.70)
+            es = (1.2, 2.2)
+            ra = 0.8
+            if common_params_override:
+                tr = common_params_override.get('thickness_range', tr)
+                cr = common_params_override.get('center_rel_range', cr)
+                cs = common_params_override.get('center_scale_range', cs)
+                es = common_params_override.get('edge_softness_scale', es)
+                ra = common_params_override.get('rough_amp_scale', ra)
+
+            thickness = base_r * random.uniform(*tr)
+            depth = (random.uniform(0.35, 0.75) if very_dark else random.uniform(0.22, 0.55))
+            center_rel = random.uniform(*cr)
+            center_scale = random.uniform(*cs)
+            edge_eff = edge * random.uniform(*es)
+            mote = _common_donut_mote(
+                h, w, cx, cy, base_r, thickness, edge_eff, rough_amp * ra,
+                depth, center_rel, center_scale, device
+            )
+
+        elif mote_type == "disc":
             mask = _circular_mask_jittered(h, w, cx, cy, base_r, edge, rough_amp, device)
             depth = (random.uniform(0.45, 0.75) if very_dark else random.uniform(0.25, 0.55))
             # Slight edge darkening to emulate shadow boundary

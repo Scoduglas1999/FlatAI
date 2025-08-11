@@ -30,7 +30,7 @@ except ImportError:
 # =============================================================================
 # --- IMPORTANT: User must set these paths ---
 # Path to the trained U-Net model file (.pth)
-MODEL_PATH = "./unet_pinn_checkpoint.pth"  # Use the available PINN model
+MODEL_PATH = "./unet_pinn_checkpoint.pth"  # default; adjust to flat model as needed
 # Path to the large astronomical image you want to correct
 IMAGE_PATH_TO_CORRECT = "./Image34.fit"  # Test with FITS image
 # Path to save the final, corrected image
@@ -39,6 +39,7 @@ CORRECTED_IMAGE_SAVE_PATH = "./test_corrected_rgb.fits"
 # -- Processing Parameters --
 TILE_SIZE = 256  # The model was trained on 256x256 patches
 TILE_OVERLAP = 48  # How much the tiles should overlap to avoid edge artifacts
+USE_GLOBAL_NORMALIZATION = True  # use global robust normalization to reduce seams/brightness drift
 
 # =============================================================================
 # --- 2. HELPER FUNCTIONS ---
@@ -110,29 +111,27 @@ def load_astro_image(image_path):
         print(f"   [ERROR] Could not load image: {e}")
         return None
 
-def preprocess_tile(tile_np):
-    """Preprocesses a NumPy tile for the U-Net model using the same normalization as training."""
-    # Apply the EXACT same normalization logic as training:
-    # 1. Normalize tile to [0, 1] using tile's own min/max (per-patch normalization)
-    tile_min, tile_max = tile_np.min(), tile_np.max()
-    if tile_max > tile_min:
-        tile_normalized_01 = (tile_np - tile_min) / (tile_max - tile_min)
+def preprocess_tile(tile_np, global_min=None, global_max=None):
+    """Preprocess a tile with global or per-tile normalization. Returns (tensor, used_min, used_max)."""
+    if (global_min is not None) and (global_max is not None) and (global_max > global_min):
+        tile01 = (tile_np - global_min) / (global_max - global_min)
+        tile01 = np.clip(tile01, 0.0, 1.0)
+        used_min, used_max = global_min, global_max
     else:
-        tile_normalized_01 = tile_np - tile_np.mean()  # Handle flat tiles
-    
-    # 2. Convert [0, 1] to [-1, 1] (exactly like the dataset loader)
-    tile_normalized = tile_normalized_01 * 2.0 - 1.0
-    
-    tile_tensor = torch.from_numpy(tile_normalized.astype(np.float32))
-    tile_tensor = tile_tensor.unsqueeze(0).unsqueeze(0)
-    return tile_tensor
+        tmin, tmax = tile_np.min(), tile_np.max()
+        used_min, used_max = float(tmin), float(tmax)
+        if tmax > tmin:
+            tile01 = (tile_np - tmin) / (tmax - tmin)
+        else:
+            tile01 = np.zeros_like(tile_np)
+    tile = tile01 * 2.0 - 1.0
+    tensor = torch.from_numpy(tile.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    return tensor, used_min, used_max
 
-def postprocess_tile(tile_tensor, original_tile):
-    """Post-processes a corrected tensor from the model back to a NumPy array in [0, 1] range."""
-    tile_np = tile_tensor.squeeze(0).squeeze(0)
-    tile_np = tile_np.cpu().detach().numpy()
-    tile_np = (tile_np + 1.0) / 2.0
-    return np.clip(tile_np, 0, 1)
+def postprocess_tile(tile_tensor):
+    """Map model output from [-1,1] to [0,1] float."""
+    tile_np = tile_tensor.squeeze(0).squeeze(0).cpu().detach().numpy()
+    return np.clip((tile_np + 1.0) / 2.0, 0.0, 1.0)
 
 def create_blending_window(size):
     """
@@ -160,11 +159,15 @@ def _process_single_channel(image_2d, model, device):
     """
     Processes a single 2D grayscale channel. Contains the core tiling and blending logic.
     """
-    # No global normalization needed - preprocessing handles per-tile normalization
+    # Optionally compute global robust range for normalization
     print(f"Processing image with shape: {image_2d.shape}, range: [{image_2d.min():.3f}, {image_2d.max():.3f}]")
     
-    # Store original range for final rescaling
-    original_min, original_max = np.min(image_2d), np.max(image_2d)
+    # Store original range for final rescaling (if not using global min/max)
+    original_min, original_max = float(np.min(image_2d)), float(np.max(image_2d))
+    global_min = global_max = None
+    if USE_GLOBAL_NORMALIZATION:
+        global_min = float(np.percentile(image_2d, 0.1))
+        global_max = float(np.percentile(image_2d, 99.9))
     
     # 2. Tiled Processing
     corrected_image = np.zeros_like(image_2d, dtype=np.float32)
@@ -181,29 +184,23 @@ def _process_single_channel(image_2d, model, device):
             
     for y in y_coords:
         for x in x_coords:
-            # Extract raw tile from original data
             tile = image_2d[y:y+TILE_SIZE, x:x+TILE_SIZE]
-            
-            # Skip processing if tile has no dynamic range
             if tile.std() < 1e-8:
-                corrected_tile = tile.copy()
+                corrected = tile.astype(np.float32)
             else:
-                # Preprocessing now handles per-tile normalization to [-1, 1]
-                input_tensor = preprocess_tile(tile).to(device)
+                input_tensor, used_min, used_max = preprocess_tile(tile, global_min, global_max)
+                input_tensor = input_tensor.to(device)
                 with torch.no_grad():
                     corrected_tensor = model(input_tensor)
-                
-                # Postprocess: Convert from [-1, 1] back to tile's original range
-                corrected_tile = postprocess_tile(corrected_tensor, tile)
-            
-            corrected_image[y:y+TILE_SIZE, x:x+TILE_SIZE] += corrected_tile * window
+                corrected01 = postprocess_tile(corrected_tensor)
+                corrected = corrected01 * (used_max - used_min) + used_min
+            corrected_image[y:y+TILE_SIZE, x:x+TILE_SIZE] += corrected * window
             weight_map[y:y+TILE_SIZE, x:x+TILE_SIZE] += window
 
     # 3. Final Blending
     weight_map[weight_map == 0] = 1.0
     corrected_image /= weight_map
-    
-    return corrected_image
+    return corrected_image.astype(np.float32)
 
 # =============================================================================
 # --- 3. MAIN EXECUTION LOGIC ---
