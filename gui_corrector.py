@@ -17,6 +17,7 @@ import torch.nn as nn
 from astropy.io import fits
 from tqdm import tqdm
 import time
+import tkinter.font as tkfont
 
 # Handle potential missing imports
 try:
@@ -32,9 +33,33 @@ except ImportError:
 # --- Import the correct model architecture ---
 from unet_model import AttentionResUNet
 
+# Optional: modern ttk theme (sv-ttk) and drag-and-drop (tkinterdnd2)
+# These are optional dependencies; the app works without them.
+try:
+    import sv_ttk  # pip install sv-ttk
+    _HAS_SVTTK = True
+except Exception:
+    sv_ttk = None
+    _HAS_SVTTK = False
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # pip install tkinterdnd2
+    _HAS_DND = True
+except Exception:
+    DND_FILES = None
+    TkinterDnD = None
+    _HAS_DND = False
+
 # Default model paths
-PREFERRED_MODEL = "./unet_flat_model_final.pth"
-FALLBACK_MODEL = "./unet_flat_checkpoint.pth"
+# Use a fixed, never-changing model path as requested
+PREFERRED_MODEL = r"C:\Users\scdou\Documents\NeuralNet\unet_flat_checkpoint.pth"
+FALLBACK_MODEL = r"C:\Users\scdou\Documents\NeuralNet\unet_flat_checkpoint.pth"
+
+# UI theme colors for card-style design
+ACCENT_COLOR = "#1e3a8a"  # Deep blue accent
+CARD_BG = "#1b2433"       # Dark slate card background
+CARD_BORDER = "#243247"    # Subtle border color for 3D flair
+WINDOW_BG = "#0f172a"      # Very dark background behind cards
 
 # =============================================================================
 # --- BACKEND PROCESSING LOGIC (keeping existing functions) ---
@@ -641,24 +666,63 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
 # --- 2. GUI FRONTEND LOGIC ---
 # =============================================================================
 
-class FlatAICorrectorApp(tk.Tk):
+# Use a DnD-aware base window if available
+BaseTk = TkinterDnD.Tk if _HAS_DND else tk.Tk
+
+
+class FlatAICorrectorApp(BaseTk):
     def __init__(self):
         super().__init__()
         self.title("FlatAI - Flat-Field Correction")
-        self.geometry("800x700")
+        self.geometry("900x720")
         self.resizable(True, True)
         
         # Configure modern styling
-        self.configure(bg='#f0f0f0')
+        self.configure(bg=WINDOW_BG)
         style = ttk.Style()
-        style.theme_use('clam')
+        # Prefer a modern theme if available (sv-ttk); fallback to clam
+        if _HAS_SVTTK:
+            sv_ttk.set_theme("dark")  # start in dark mode; toggle available in footer
+        else:
+            style.theme_use('clam')
         
-        # Configure colors for modern look
-        style.configure('Title.TLabel', font=('Segoe UI', 20, 'bold'), foreground='#2c3e50')
-        style.configure('Subtitle.TLabel', font=('Segoe UI', 12), foreground='#34495e')
-        style.configure('Info.TLabel', font=('Segoe UI', 10), foreground='#7f8c8d')
-        style.configure('Success.TLabel', font=('Segoe UI', 10, 'bold'), foreground='#27ae60')
-        style.configure('Warning.TLabel', font=('Segoe UI', 10, 'bold'), foreground='#e67e22')
+        # Configure colors and typography for modern look
+        # Also create concrete tk.Fonts to ensure visible changes regardless of theme
+        try:
+            self.font_title = tkfont.Font(family='Segoe UI Variable Display', size=24, weight='bold')
+        except Exception:
+            self.font_title = tkfont.Font(family='Segoe UI', size=24, weight='bold')
+        try:
+            self.font_subtitle = tkfont.Font(family='Segoe UI Semibold', size=12)
+        except Exception:
+            self.font_subtitle = tkfont.Font(family='Segoe UI', size=12, weight='bold')
+        self.font_body = tkfont.Font(family='Segoe UI', size=10)
+
+        style.configure('Title.TLabel', font=self.font_title, foreground=ACCENT_COLOR, background=WINDOW_BG)
+        style.configure('Subtitle.TLabel', font=self.font_subtitle, background=CARD_BG)
+        style.configure('Info.TLabel', font=self.font_body, foreground='#cbd5e1', background=CARD_BG)
+        style.configure('Success.TLabel', font=('Segoe UI', 10, 'bold'))
+        style.configure('Warning.TLabel', font=('Segoe UI', 10, 'bold'))
+        # Deep blue accent for progress bar and buttons
+        style.configure('DeepBlue.Horizontal.TProgressbar', troughcolor=CARD_BG, background=ACCENT_COLOR)
+        try:
+            style.configure('Accent.TButton', foreground='white')
+            style.map('Accent.TButton', background=[('!disabled', ACCENT_COLOR), ('pressed', '#27408f'), ('active', '#2a4bb5')])
+        except Exception:
+            pass
+
+        # Modern entry styling
+        try:
+            style.element_create('Rounded.field', 'from', 'clam')
+            style.layout('Modern.TEntry',
+                         [('Entry.padding', {'children': [('Entry.textarea', {'sticky': 'nswe'})], 'sticky': 'nswe'})])
+            style.configure('Modern.TEntry', padding=(12, 10), foreground='#e5e7eb', fieldbackground='#0f1a2b', borderwidth=1)
+            style.map('Modern.TEntry',
+                      lightcolor=[('focus', ACCENT_COLOR), ('!focus', CARD_BORDER)],
+                      bordercolor=[('focus', ACCENT_COLOR), ('!focus', CARD_BORDER)],
+                      fieldbackground=[('disabled', '#0f1a2b'), ('focus', '#0f1c32')])
+        except Exception:
+            pass
         
         # Configure accent button style
         style.configure('Accent.TButton', font=('Segoe UI', 12, 'bold'), padding=(20, 10))
@@ -672,147 +736,170 @@ class FlatAICorrectorApp(tk.Tk):
 
         self.save_float32_var = tk.BooleanVar(value=True)  # default to float32 to avoid banding
         self.overwrite_var = tk.BooleanVar(value=False)    # overwrite input file (destructive)
+        self.dark_mode_var = tk.BooleanVar(value=True if _HAS_SVTTK else False)
 
         self.setup_ui()
+        # Global window DnD: drop a file anywhere to set as input image
+        if _HAS_DND:
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind('<<Drop>>', self._on_drop_input)
+            except Exception:
+                pass
         self.update_run_button_state()
 
     def setup_ui(self):
-        """Set up the modern, purpose-focused user interface."""
-        # Main container with padding
-        main_container = ttk.Frame(self, padding="20")
-        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Configure grid weights
+        """Set up a modern, card-based interface with deep blue accents."""
+        # Main container with padding and dark background
+        main_container = tk.Frame(self, bg=WINDOW_BG)
+        main_container.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
+        main_container.grid_columnconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        main_container.columnconfigure(1, weight=1)
 
         # ===== HEADER SECTION =====
-        header_frame = ttk.Frame(main_container)
-        header_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 20))
-        
-        # Title and subtitle
-        title_label = ttk.Label(header_frame, text="FlatAI", style='Title.TLabel')
-        title_label.grid(row=0, column=0, sticky=tk.W)
-        
-        subtitle_label = ttk.Label(header_frame, text="Advanced Flat-Field Correction", style='Subtitle.TLabel')
-        subtitle_label.grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
-        
-        # Purpose description
+        header = tk.Frame(main_container, bg=WINDOW_BG)
+        header.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=20, pady=(16, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(header, text="FlatAI", style='Title.TLabel', font=self.font_title).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(header, text="Advanced Flat-Field Correction", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
         purpose_text = "Remove dust motes, vignetting, and uneven illumination from astronomical images using AI"
-        purpose_label = ttk.Label(header_frame, text=purpose_text, style='Info.TLabel', wraplength=600)
-        purpose_label.grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+        ttk.Label(header, text=purpose_text, style='Info.TLabel', font=self.font_body, wraplength=820).grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
 
-        # ===== INPUT SECTION =====
-        input_frame = ttk.LabelFrame(main_container, text="Input Configuration", padding="15")
-        input_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
-        input_frame.columnconfigure(1, weight=1)
+        # Utility to make a shadowed card
+        def make_card(parent, title, row):
+            """Create a card using grid only (no place) so geometry propagates.
+            A shadow is simulated by stacking a background frame with offset padding.
+            """
+            wrapper = tk.Frame(parent, bg=WINDOW_BG)
+            wrapper.grid(row=row, column=0, sticky=(tk.N, tk.S, tk.E, tk.W), padx=20, pady=8)
+            wrapper.grid_rowconfigure(0, weight=1)
+            wrapper.grid_columnconfigure(0, weight=1)
 
-        # Input Image Selection
-        ttk.Label(input_frame, text="Input Image:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        ttk.Label(input_frame, text="Select your astronomical image (FITS, XISF, JPG, PNG)", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
-        
-        input_entry_frame = ttk.Frame(input_frame)
-        input_entry_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        input_entry_frame.columnconfigure(0, weight=1)
-        
-        self.input_entry = ttk.Entry(input_entry_frame, textvariable=self.image_path, font=('Segoe UI', 10))
+            # Shadow behind the card (shows at bottom-right via padding)
+            shadow = tk.Frame(wrapper, bg="#0b1220")
+            shadow.grid(row=0, column=0, sticky='nsew', padx=(6, 0), pady=(6, 0))
+
+            # Card body on top
+            card = tk.Frame(wrapper, bg=CARD_BG, highlightbackground=CARD_BORDER, highlightthickness=1, bd=0)
+            card.grid(row=0, column=0, sticky='nsew')
+
+            # Title
+            title_bar = tk.Frame(card, bg=CARD_BG)
+            title_bar.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 6))
+            ttk.Label(title_bar, text=title, style='Subtitle.TLabel', font=self.font_subtitle).pack(side=tk.LEFT)
+
+            # Accent underline for section
+            underline = tk.Frame(card, bg=ACCENT_COLOR, height=2)
+            underline.grid(row=1, column=0, sticky='ew', padx=14, pady=(0, 6))
+
+            # Content area
+            content = tk.Frame(card, bg=CARD_BG)
+            content.grid(row=2, column=0, sticky='nsew', padx=14, pady=(0, 14))
+            card.grid_rowconfigure(2, weight=1)
+            card.grid_columnconfigure(0, weight=1)
+            return content
+
+        # ===== INPUT CARD =====
+        input_content = make_card(main_container, "Input Configuration", 1)
+        # row/column layout inside card content
+        for c in range(3):
+            input_content.grid_columnconfigure(c, weight=1)
+
+        ttk.Label(input_content, text="Input Image:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=0, column=0, sticky='w', pady=(0, 4), columnspan=3)
+        ttk.Label(input_content, text="Select your astronomical image (FITS, XISF, JPG, PNG)", style='Info.TLabel', font=self.font_body).grid(row=1, column=0, sticky=tk.W, columnspan=3)
+        input_entry_frame = tk.Frame(input_content, bg=CARD_BG)
+        input_entry_frame.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(6, 10))
+        input_entry_frame.grid_columnconfigure(0, weight=1)
+        self.input_entry = ttk.Entry(input_entry_frame, textvariable=self.image_path, font=('Segoe UI', 10), style='Modern.TEntry')
         self.input_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
         ttk.Button(input_entry_frame, text="Browse...", command=self.browse_input_image).grid(row=0, column=1)
+        self._enable_dnd_for_entry(self.input_entry, self._on_drop_input)
+        if _HAS_DND:
+            ttk.Label(input_content, text="Tip: Drag & drop a file onto the box above.", style='Info.TLabel', font=self.font_body).grid(row=3, column=0, sticky=tk.W, pady=(0, 2), columnspan=3)
 
-        # Model File Selection
-        ttk.Label(input_frame, text="Model File (Optional):", style='Subtitle.TLabel').grid(row=3, column=0, sticky=tk.W, pady=(10, 5))
-        ttk.Label(input_frame, text="AI model for correction. Auto-detects if not specified.", style='Info.TLabel').grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
-        
-        model_entry_frame = ttk.Frame(input_frame)
-        model_entry_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        model_entry_frame.columnconfigure(0, weight=1)
-        
-        self.model_entry = ttk.Entry(model_entry_frame, textvariable=self.model_path, font=('Segoe UI', 10))
+        ttk.Label(input_content, text="Model File:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=4, column=0, sticky='w', pady=(8, 4), columnspan=3)
+        ttk.Label(input_content, text="AI model for correction.", style='Info.TLabel', font=self.font_body).grid(row=5, column=0, sticky=tk.W, columnspan=3)
+        model_entry_frame = tk.Frame(input_content, bg=CARD_BG)
+        model_entry_frame.grid(row=6, column=0, columnspan=3, sticky='ew', pady=(6, 4))
+        model_entry_frame.grid_columnconfigure(0, weight=1)
+        self.model_entry = ttk.Entry(model_entry_frame, textvariable=self.model_path, font=('Segoe UI', 10), style='Modern.TEntry')
         self.model_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
         ttk.Button(model_entry_frame, text="Browse...", command=self.browse_model_file).grid(row=0, column=1)
+        self._enable_dnd_for_entry(self.model_entry, self._on_drop_model)
 
-        # ===== OUTPUT SECTION =====
-        output_frame = ttk.LabelFrame(main_container, text="Output Configuration", padding="15")
-        output_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
-        output_frame.columnconfigure(1, weight=1)
+        # Set default model immediately
+        if not self.model_path.get():
+            self.model_path.set(PREFERRED_MODEL)
 
-        # Output Path Selection
-        ttk.Label(output_frame, text="Output Path:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        ttk.Label(output_frame, text="Where to save the corrected image", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
-        
-        output_entry_frame = ttk.Frame(output_frame)
-        output_entry_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        output_entry_frame.columnconfigure(0, weight=1)
-        
-        self.output_entry = ttk.Entry(output_entry_frame, textvariable=self.output_path, font=('Segoe UI', 10))
+        # ===== OUTPUT CARD =====
+        output_content = make_card(main_container, "Output Configuration", 2)
+        output_content.grid_columnconfigure(0, weight=1)
+        ttk.Label(output_content, text="Output Path:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=0, column=0, sticky='w')
+        ttk.Label(output_content, text="Where to save the corrected image", style='Info.TLabel', font=self.font_body).grid(row=1, column=0, sticky=tk.W)
+        output_entry_frame = tk.Frame(output_content, bg=CARD_BG)
+        output_entry_frame.grid(row=2, column=0, sticky='ew', pady=(6, 4))
+        output_entry_frame.grid_columnconfigure(0, weight=1)
+        self.output_entry = ttk.Entry(output_entry_frame, textvariable=self.output_path, font=('Segoe UI', 10), style='Modern.TEntry')
         self.output_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
         self.output_browse_btn = ttk.Button(output_entry_frame, text="Browse...", command=self.browse_output_path)
         self.output_browse_btn.grid(row=0, column=1)
+        self._enable_dnd_for_entry(self.output_entry, self._on_drop_output)
 
-        # ===== PROCESSING OPTIONS SECTION =====
-        options_frame = ttk.LabelFrame(main_container, text="Processing Options", padding="15")
-        options_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
+        # ===== OPTIONS CARD =====
+        options_content = make_card(main_container, "Processing Options", 3)
+        options_content.grid_columnconfigure(0, weight=1)
+        mode_frame = tk.Frame(options_content, bg=CARD_BG)
+        mode_frame.grid(row=0, column=0, sticky='w')
+        ttk.Label(mode_frame, text="Processing Mode:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
+        ttk.Label(mode_frame, text="How to handle image normalization", style='Info.TLabel', font=self.font_body).grid(row=1, column=0, sticky=tk.W)
+        btns = tk.Frame(mode_frame, bg=CARD_BG)
+        btns.grid(row=2, column=0, sticky='w', pady=(6, 8))
+        ttk.Radiobutton(btns, text="Auto-detect (Recommended)", value="auto", variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(btns, text="Force Linear", value="linear", variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(btns, text="Force Non-linear", value="nonlinear", variable=self.force_mode_var).pack(side=tk.LEFT)
+        toggles = tk.Frame(options_content, bg=CARD_BG)
+        toggles.grid(row=1, column=0, sticky='w')
+        # Modern checkbuttons with better contrast
+        ttk.Checkbutton(toggles, text="Save as float32 (prevents banding artifacts)", variable=self.save_float32_var).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Checkbutton(toggles, text="Overwrite input file", variable=self.overwrite_var, command=self.on_overwrite_toggle).pack(side=tk.LEFT)
 
-        # Processing Mode
-        mode_frame = ttk.Frame(options_frame)
-        mode_frame.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
-        
-        ttk.Label(mode_frame, text="Processing Mode:", style='Subtitle.TLabel').grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        ttk.Label(mode_frame, text="How to handle image normalization", style='Info.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
-        
-        mode_buttons_frame = ttk.Frame(mode_frame)
-        mode_buttons_frame.grid(row=2, column=0, sticky=tk.W)
-        
-        ttk.Radiobutton(mode_buttons_frame, text="Auto-detect (Recommended)", value="auto", 
-                       variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(mode_buttons_frame, text="Force Linear", value="linear", 
-                       variable=self.force_mode_var).pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(mode_buttons_frame, text="Force Non-linear", value="nonlinear", 
-                       variable=self.force_mode_var).pack(side=tk.LEFT)
-
-        # Output Options
-        output_options_frame = ttk.Frame(options_frame)
-        output_options_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W)
-        
-        ttk.Checkbutton(output_options_frame, text="Save as float32 (prevents banding artifacts)", 
-                       variable=self.save_float32_var).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Checkbutton(output_options_frame, text="Overwrite input file", 
-                       variable=self.overwrite_var, command=self.on_overwrite_toggle).pack(side=tk.LEFT)
-
-        # ===== PROCESSING SECTION =====
-        processing_frame = ttk.LabelFrame(main_container, text="Processing", padding="15")
-        processing_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 15))
-        processing_frame.columnconfigure(1, weight=1)
-
+        # ===== PROCESSING CARD =====
+        processing_content = make_card(main_container, "Processing", 4)
+        processing_content.grid_columnconfigure(0, weight=1)
         # Run Button
-        self.run_button = ttk.Button(processing_frame, text="🚀 Start Flat-Field Correction", 
-                                    command=self.start_correction, style='Accent.TButton')
-        self.run_button.grid(row=0, column=0, columnspan=3, pady=(0, 15))
-
-        # Progress Bar
-        ttk.Label(processing_frame, text="Progress:", style='Subtitle.TLabel').grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        self.run_button = ttk.Button(processing_content, text="🚀 Start Flat-Field Correction", command=self.start_correction, style='Accent.TButton')
+        self.run_button.grid(row=0, column=0, sticky='ew', pady=(0, 12))
+        # Progress and Status
+        ttk.Label(processing_content, text="Progress:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=1, column=0, sticky='w', pady=(0, 4))
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(processing_frame, variable=self.progress_var, 
-                                          maximum=100, length=600, mode='determinate')
-        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        # Status Display
-        ttk.Label(processing_frame, text="Status:", style='Subtitle.TLabel').grid(row=3, column=0, sticky=(tk.W, tk.N), pady=(0, 5))
+        self.progress_bar = ttk.Progressbar(processing_content, variable=self.progress_var, maximum=100, mode='determinate', style='DeepBlue.Horizontal.TProgressbar')
+        self.progress_bar.grid(row=2, column=0, sticky='ew', pady=(0, 10))
+        ttk.Label(processing_content, text="Status:", style='Subtitle.TLabel', font=self.font_subtitle).grid(row=3, column=0, sticky='w', pady=(4, 4))
         self.status_var = tk.StringVar(value="Ready to process. Select an input image and click 'Start Flat-Field Correction'.")
-        self.status_label = ttk.Label(processing_frame, textvariable=self.status_var, 
-                                     wraplength=600, justify=tk.LEFT, style='Info.TLabel')
-        self.status_label.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.status_label = ttk.Label(processing_content, textvariable=self.status_var, wraplength=820, justify=tk.LEFT, style='Info.TLabel', font=self.font_body)
+        self.status_label.grid(row=4, column=0, sticky='ew')
 
         # ===== FOOTER SECTION =====
-        footer_frame = ttk.Frame(main_container)
-        footer_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(10, 0))
+        footer_frame = tk.Frame(main_container, bg=WINDOW_BG)
+        footer_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), padx=20, pady=(6, 8))
         
         # Device Info
         device = "CUDA" if torch.cuda.is_available() else "CPU"
         device_label = ttk.Label(footer_frame, text=f"Processing Device: {device}", style='Info.TLabel')
         device_label.pack(side=tk.LEFT)
         
+        # Theme toggle (only visible if sv-ttk is installed)
+        if _HAS_SVTTK:
+            # Improve contrast and clarity of the theme toggle
+            ttk.Checkbutton(
+                footer_frame,
+                text="Dark Mode",
+                variable=self.dark_mode_var,
+                command=self.toggle_theme
+            ).pack(side=tk.RIGHT, padx=(10, 0))
+
         # Version info
         version_label = ttk.Label(footer_frame, text="FlatAI v1.0 - 40M Parameter U-Net", style='Info.TLabel')
         version_label.pack(side=tk.RIGHT)
@@ -858,6 +945,82 @@ class FlatAICorrectorApp(tk.Tk):
             self.run_button.config(state='normal')
         else:
             self.run_button.config(state='disabled')
+
+    # ---------- Modern UX helpers ----------
+    def toggle_theme(self):
+        """Toggle light/dark theme when sv-ttk is available."""
+        if not _HAS_SVTTK:
+            return
+        if self.dark_mode_var.get():
+            sv_ttk.set_theme("dark")
+        else:
+            sv_ttk.set_theme("light")
+
+    def _enable_dnd_for_entry(self, entry_widget: ttk.Entry, drop_handler):
+        """Enable drag-and-drop for an entry if tkinterdnd2 is installed."""
+        if not _HAS_DND:
+            return
+        try:
+            entry_widget.drop_target_register(DND_FILES)
+            entry_widget.dnd_bind('<<Drop>>', drop_handler)
+            # Optional: small visual hint on enter/leave
+            entry_widget.dnd_bind('<<DragEnter>>', lambda e, w=entry_widget: w.configure(cursor='hand2'))
+            entry_widget.dnd_bind('<<DragLeave>>', lambda e, w=entry_widget: w.configure(cursor='xterm'))
+        except Exception:
+            pass
+
+    def _paths_from_dnd_event(self, event) -> list:
+        """Parse DnD event data into a list of filesystem paths."""
+        try:
+            return list(self.tk.splitlist(event.data))
+        except Exception:
+            return [str(event.data)] if event and getattr(event, 'data', None) else []
+
+    def _first_path(self, event) -> str | None:
+        paths = self._paths_from_dnd_event(event)
+        return paths[0] if paths else None
+
+    def _on_drop_input(self, event):
+        path = self._first_path(event)
+        if not path:
+            return 'break'
+        self.image_path.set(path)
+        if self.overwrite_var.get():
+            self.output_path.set(path)
+        self.update_run_button_state()
+        return 'break'
+
+    def _on_drop_model(self, event):
+        path = self._first_path(event)
+        if not path:
+            return 'break'
+        if not path.lower().endswith('.pth'):
+            # Allow, but inform
+            self.update_status("Model file dropped is not a .pth; proceeding anyway.")
+        self.model_path.set(path)
+        self.update_run_button_state()
+        return 'break'
+
+    def _on_drop_output(self, event):
+        path = self._first_path(event)
+        if not path:
+            return 'break'
+        # If a directory is dropped, synthesize a filename
+        try:
+            if os.path.isdir(path):
+                base = os.path.basename(self.image_path.get()) or 'corrected'
+                base_noext = os.path.splitext(base)[0]
+                path = os.path.join(path, f"{base_noext}_corrected.fits")
+            else:
+                # Ensure .fits extension
+                root, ext = os.path.splitext(path)
+                if ext.lower() not in ('.fits', '.fit'):
+                    path = root + '.fits'
+        except Exception:
+            pass
+        self.output_path.set(path)
+        self.update_run_button_state()
+        return 'break'
 
     def start_correction(self):
         self.is_processing = True

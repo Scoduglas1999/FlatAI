@@ -243,7 +243,7 @@ def main():
             val_losses = checkpoint.get('val_losses', [])
             best_val_loss = checkpoint.get('loss', float('inf'))
 
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(False)
 
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     scaler = torch.amp.GradScaler(device_type, enabled=(USE_AMP and device.type == 'cuda'))
