@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class ResidualBlock(nn.Module):
     """
@@ -151,6 +152,118 @@ class AttentionResUNet(nn.Module):
         # --- Output ---
         out = self.out_conv(d1)
         return out
+
+
+class AttentionResUNetFG(nn.Module):
+    """
+    Variant that predicts multiplicative (F) and additive (G) fields instead of a clean image.
+    - F is parameterized via a bounded log-scale: logF in [-log(F_max), +log(F_max)], F = exp(logF)
+    - G is parameterized in [0, 1] via a sigmoid
+    """
+    def __init__(self, max_flat_scale: float = 3.0):
+        super().__init__()
+
+        # --- Encoder Path --- (identical to AttentionResUNet)
+        # Accepts image plus coordinate channels (x,y) and a noise map → 4 channels
+        self.enc1 = ResidualBlock(4, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = ResidualBlock(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = ResidualBlock(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = ResidualBlock(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
+
+        # --- Bottleneck ---
+        self.bottleneck = ResidualBlock(512, 1024)
+
+        # --- Decoder Path ---
+        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.dec_conv4 = ResidualBlock(1024, 512)
+        self.att4 = AttentionGate(F_g=512, F_l=512, F_int=256)
+        self.dec_combine4 = ResidualBlock(1024, 512)
+
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.dec_conv3 = ResidualBlock(512, 256)
+        self.att3 = AttentionGate(F_g=256, F_l=256, F_int=128)
+        self.dec_combine3 = ResidualBlock(512, 256)
+
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.dec_conv2 = ResidualBlock(256, 128)
+        self.att2 = AttentionGate(F_g=128, F_l=128, F_int=64)
+        self.dec_combine2 = ResidualBlock(256, 128)
+
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.dec_conv1 = ResidualBlock(128, 64)
+        self.att1 = AttentionGate(F_g=64, F_l=64, F_int=32)
+        self.dec_combine1 = ResidualBlock(128, 64)
+
+        # Heads: predict 3 channels (logF, G, M)
+        self.out_conv_fg = nn.Conv2d(64, 3, kernel_size=1)
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
+        # Store max log-scale for multiplicative field
+        import math
+        self.register_buffer('max_log_F', torch.tensor(float(math.log(max_flat_scale))), persistent=False)
+
+    def forward(self, x):
+        # Accepts either:
+        #  - [B,1,H,W] image in [-1,1]; coords/noise computed internally per tile
+        #  - [B,3,H,W] image + absolute xx,yy in [0,1]
+        #  - [B,4,H,W] image + xx,yy + noise sigma map in [0,1]
+        if x.dim() != 4:
+            raise ValueError("Input must be [B,C,H,W]")
+        b, c, h, w = x.shape
+        device = x.device
+
+        img = x[:, 0:1, :, :]
+        if c >= 3:
+            xx = x[:, 1:2, :, :]
+            yy = x[:, 2:3, :, :]
+        else:
+            yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
+            xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
+
+        if c == 4:
+            sigma = x[:, 3:4, :, :]
+        else:
+            # Approximate local noise sigma from high-frequency energy of the normalized input
+            x01 = torch.clamp((img + 1.0) / 2.0, 0.0, 1.0)
+            mu = F.avg_pool2d(x01, kernel_size=3, stride=1, padding=1)
+            hf = x01 - mu
+            var = F.avg_pool2d(hf * hf, kernel_size=3, stride=1, padding=1)
+            sigma = torch.sqrt(torch.clamp(var, 1e-6))
+
+        xcat = torch.cat([img, xx, yy, sigma], dim=1)
+
+        # Encoder
+        enc1_out = self.enc1(xcat)
+        enc2_out = self.enc2(self.pool1(enc1_out))
+        enc3_out = self.enc3(self.pool2(enc2_out))
+        enc4_out = self.enc4(self.pool3(enc3_out))
+
+        # Bottleneck
+        bottleneck_out = self.bottleneck(self.pool4(enc4_out))
+
+        # Decoder
+        d4 = self.dec_conv4(self.up4(bottleneck_out))
+        d4 = self.dec_combine4(torch.cat([self.att4(d4, enc4_out), d4], dim=1))
+
+        d3 = self.dec_conv3(self.up3(d4))
+        d3 = self.dec_combine3(torch.cat([self.att3(d3, enc3_out), d3], dim=1))
+
+        d2 = self.dec_conv2(self.up2(d3))
+        d2 = self.dec_combine2(torch.cat([self.att2(d2, enc2_out), d2], dim=1))
+
+        d1 = self.dec_conv1(self.up1(d2))
+        d1 = self.dec_combine1(torch.cat([self.att1(d1, enc1_out), d1], dim=1))
+
+        out = self.out_conv_fg(d1)
+        logF_raw = self.tanh(out[:, 0:1, :, :]) * self.max_log_F  # [-max_log_F, +max_log_F]
+        F_mul = torch.exp(logF_raw)  # (0, max_flat_scale]
+        G = self.sigmoid(out[:, 1:2, :, :])  # [0,1]
+        M = self.sigmoid(out[:, 2:3, :, :])  # [0,1], confidence/strength
+        return F_mul, G, M
 
 # Optional test block to verify the architecture and parameter count
 if __name__ == '__main__':

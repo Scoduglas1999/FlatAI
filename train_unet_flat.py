@@ -16,7 +16,7 @@ import torchvision.transforms as transforms
 from torchvision.models import vgg19, VGG19_Weights
 
 from flat_dataset import FlatFieldDataset
-from unet_model import AttentionResUNet
+from unet_model import AttentionResUNet, AttentionResUNetFG
 
 
 # --- Stabilize lpips normalization ---
@@ -117,7 +117,7 @@ FINAL_MODEL_SAVE_PATH = "./unet_flat_model_final.pth"
 SAMPLE_IMAGE_DIR = "./flat_training_samples/"
 LOSS_CURVE_PATH = "./flat_loss_curve.png"
 
-RESUME_TRAINING = True
+RESUME_TRAINING = False
 FINE_TUNING_MODE = False
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 8
@@ -223,7 +223,8 @@ def main():
     )
 
     # Model & losses
-    model = AttentionResUNet().to(device)
+    # Switch to FG model that predicts multiplicative (F) and additive (G) fields
+    model = AttentionResUNetFG().to(device)
     l1_criterion = nn.L1Loss()
     lpips_loss_fn = lpips.LPIPS(net='alex', spatial=False).to(device)
     style_criterion = StyleLoss().to(device)
@@ -280,8 +281,21 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
-                pred = model(affected)
-                pred = torch.clamp(pred, -1.0, 1.0)
+                # Build absolute coordinate channels for global context
+                b, _, h, w = affected.shape
+                yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
+                xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
+                affected_in = torch.cat([affected, xx, yy], dim=1)
+                F_pred, G_pred, M_pred = model(affected_in)
+                # Reconstruct clean target using forward model inversion
+                # Inputs/targets in [-1,1] => map to [0,1] first
+                y_obs = torch.clamp((affected + 1.0) / 2.0, 0.0, 1.0)
+                y_true = torch.clamp((sharp + 1.0) / 2.0, 0.0, 1.0)
+                # Inverse model: y_clean = clamp((y_obs - G) / F, 0, 1)
+                y_clean_ungated = torch.clamp((y_obs - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                # Confidence-gated blend with observed to prevent over-correction
+                y_clean = torch.clamp(y_obs + M_pred * (y_clean_ungated - y_obs), 0.0, 1.0)
+                pred = y_clean * 2.0 - 1.0
 
                 # Basic reconstruction losses (pred vs sharp)
                 loss_l1 = l1_criterion(pred, sharp)
@@ -291,7 +305,10 @@ def main():
 
             # Physics consistency: forward model must reproduce affected
             with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
-                re_observed = forward_flat_model(pred, flat, grad)
+                # Physics consistency: recompose observed with predicted F,G
+                y_clean01 = torch.clamp((pred + 1.0) / 2.0, 0.0, 1.0)
+                re_obs01 = torch.clamp(y_clean01 * F_pred + G_pred, 0.0, 1.0)
+                re_observed = re_obs01 * 2.0 - 1.0
                 loss_physics = l1_criterion(re_observed, affected)
 
             # Warmup schedules
@@ -299,10 +316,40 @@ def main():
             wl = min(1.0, global_step / max(1, WARMUP_LPIPS_STEPS))
             ws = min(1.0, global_step / max(1, WARMUP_STYLE_STEPS))
 
+            # Noise-aware fidelity: weight residuals by inverse variance (approx from affected)
+            with torch.no_grad():
+                mu = torch.nn.functional.avg_pool2d(y_obs, 3, 1, 1)
+                hf = y_obs - mu
+                var = torch.nn.functional.avg_pool2d(hf * hf, 3, 1, 1) + 1e-6
+                inv_var = 1.0 / var
+            loss_weighted_fid = (inv_var * (y_clean - y_true).abs()).mean()
+
+            # Identity loss outside artifacts: penalize changes where affected≈sharp
+            with torch.no_grad():
+                delta = torch.abs(affected - sharp)
+                ident_mask = (delta < 0.05).float()
+                ident_mask = torch.nn.functional.avg_pool2d(ident_mask, kernel_size=3, stride=1, padding=1)
+            # Penalize changes where mask says clean; also regularize M to be low there
+            loss_identity = (torch.abs(pred - affected) * ident_mask).mean()
+            loss_conf_clean = (M_pred * ident_mask).mean()
+
+            # Gentle priors: mean(F) ≈ 1, smooth F and G
+            loss_F_mean = (F_pred.mean(dim=[2,3]) - 1.0).abs().mean()
+            def _smoothness(t):
+                dy = (t[:,:,1:,:] - t[:,:,:-1,:]).abs()
+                dx = (t[:,:,:,1:] - t[:,:,:,:-1]).abs()
+                return (dx.mean() + dy.mean())
+            loss_smooth = _smoothness(F_pred) + 0.5 * _smoothness(G_pred)
+
             total = (LAMBDA_L1 * loss_l1 +
                      (LAMBDA_LPIPS * wl) * loss_lpips +
                      (LAMBDA_PHYSICS * wp) * loss_physics +
-                     (LAMBDA_STYLE * ws) * loss_style)
+                     (LAMBDA_STYLE * ws) * loss_style +
+                     0.2 * loss_weighted_fid +
+                     0.5 * loss_identity +
+                     0.1 * loss_conf_clean +
+                     0.05 * loss_F_mean +
+                     0.1 * loss_smooth)
 
             # NaN/Inf guard
             if not torch.isfinite(total):
@@ -339,19 +386,49 @@ def main():
                 grad = grad.to(device)
 
                 with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
-                    pred = model(affected)
-                    pred = torch.clamp(pred, -1.0, 1.0)
+                    b, _, h, w = affected.shape
+                    yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
+                    xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
+                    affected_in = torch.cat([affected, xx, yy], dim=1)
+                    F_pred, G_pred, M_pred = model(affected_in)
+                    y_obs = torch.clamp((affected + 1.0) / 2.0, 0.0, 1.0)
+                    y_true = torch.clamp((sharp + 1.0) / 2.0, 0.0, 1.0)
+                    y_clean_ungated = torch.clamp((y_obs - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                    y_clean = torch.clamp(y_obs + M_pred * (y_clean_ungated - y_obs), 0.0, 1.0)
+                    pred = y_clean * 2.0 - 1.0
                     loss_l1 = l1_criterion(pred, sharp)
                 loss_lpips = compute_lpips_fp32(lpips_loss_fn, pred, sharp)
                 loss_style = style_criterion(pred, sharp)
                 with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
-                    re_observed = forward_flat_model(pred, flat, grad)
+                    y_clean01 = torch.clamp((pred + 1.0) / 2.0, 0.0, 1.0)
+                    re_obs01 = torch.clamp(y_clean01 * F_pred + G_pred, 0.0, 1.0)
+                    re_observed = re_obs01 * 2.0 - 1.0
                     loss_physics = l1_criterion(re_observed, affected)
+
+                with torch.no_grad():
+                    mu = torch.nn.functional.avg_pool2d(y_obs, 3, 1, 1)
+                    hf = y_obs - mu
+                    var = torch.nn.functional.avg_pool2d(hf * hf, 3, 1, 1) + 1e-6
+                    inv_var = 1.0 / var
+                    delta = torch.abs(affected - sharp)
+                    ident_mask = (delta < 0.05).float()
+                    ident_mask = torch.nn.functional.avg_pool2d(ident_mask, kernel_size=3, stride=1, padding=1)
+                loss_weighted_fid = (inv_var * (y_clean - y_true).abs()).mean()
+                loss_identity = (torch.abs(pred - affected) * ident_mask).mean()
+                loss_conf_clean = (M_pred * ident_mask).mean()
+
+                loss_F_mean = (F_pred.mean(dim=[2,3]) - 1.0).abs().mean()
+                loss_smooth = _smoothness(F_pred) + 0.5 * _smoothness(G_pred)
 
                 total_val = (LAMBDA_L1 * loss_l1 +
                              LAMBDA_LPIPS * loss_lpips +
                              LAMBDA_PHYSICS * loss_physics +
-                             LAMBDA_STYLE * loss_style)
+                             LAMBDA_STYLE * loss_style +
+                             0.2 * loss_weighted_fid +
+                             0.5 * loss_identity +
+                             0.1 * loss_conf_clean +
+                             0.05 * loss_F_mean +
+                             0.1 * loss_smooth)
                 running_val += total_val.item()
                 pbar_val.set_postfix_str(f"val_loss={total_val.item():.6f}")
 

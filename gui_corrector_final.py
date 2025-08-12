@@ -22,7 +22,7 @@ try:
 except ImportError:
     Image = None
 
-from unet_model import AttentionResUNet
+from unet_model import AttentionResUNet, AttentionResUNetFG
 
 # =============================================================================
 # --- BACKEND PROCESSING LOGIC (Restored from original) ---
@@ -176,10 +176,28 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
                 input_tensor, norm_range = preprocess_tile(padded_tile, global_min, global_max)
                 input_tensor = input_tensor.to(device)
                 with torch.no_grad():
-                    corrected_tensor = model(input_tensor)
-                    # Keep output within the training domain [-1,1] to prevent downstream clipping
-                    corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
-                corrected_padded_tile = postprocess_tile(corrected_tensor, norm_range)
+                    out = model(input_tensor)
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        if len(out) == 3:
+                            F_pred, G_pred, M_pred = out
+                        else:
+                            F_pred, G_pred = out
+                            M_pred = None
+                        pmin, pmax = norm_range
+                        base_min = pmin if pmin is not None else float(padded_tile.min())
+                        base_max = pmax if pmax is not None else float(padded_tile.max())
+                        tile01 = np.clip((padded_tile - base_min) / (base_max - base_min + 1e-6), 0.0, 1.0)
+                        tile01_t = torch.from_numpy(tile01).unsqueeze(0).unsqueeze(0).to(device)
+                        y_clean01_u = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                        if M_pred is not None:
+                            y_clean01 = torch.clamp(tile01_t + M_pred * (y_clean01_u - tile01_t), 0.0, 1.0)
+                        else:
+                            y_clean01 = y_clean01_u
+                        corrected_padded_tile = y_clean01.squeeze().cpu().numpy().astype(np.float32)
+                    else:
+                        corrected_tensor = out
+                        corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
+                        corrected_padded_tile = postprocess_tile(corrected_tensor, norm_range)
             
             corrected_tile = corrected_padded_tile[:tile_h, :tile_w]
             current_window = window[:tile_h, :tile_w]
@@ -219,7 +237,13 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
         return np.sqrt(gx * gx + gy * gy).astype(np.float32)
 
     app_ref = getattr(status_callback, '__self__', None)
-    if app_ref is not None and hasattr(app_ref, 'conservative_var') and app_ref.conservative_var.get():
+    blend_mode = None
+    aggr = 0.7
+    if app_ref is not None and hasattr(app_ref, 'blend_mode_var'):
+        blend_mode = app_ref.blend_mode_var.get()
+        aggr = float(np.clip(getattr(app_ref, 'conservative_strength', lambda: 0.7)(), 0.0, 1.0)) if callable(getattr(app_ref, 'conservative_strength', None)) else float(np.clip(app_ref.conservative_strength.get(), 0.0, 1.0))
+
+    if blend_mode and blend_mode != 'none':
         # Map to [0,1] and compute difference mask
         p_lo, p_hi = np.percentile(image_2d, [0.5, 99.5])
         if not np.isfinite(p_lo) or not np.isfinite(p_hi) or p_hi <= p_lo:
@@ -228,20 +252,43 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
         corr01 = np.clip((corrected_image - p_lo) / (p_hi - p_lo + 1e-6), 0.0, 1.0)
 
         diff = corr01 - orig01
-        aggr = float(np.clip(app_ref.conservative_strength.get(), 0.0, 1.0))
-        blur_sigma = 3.0 + 7.0 * aggr
-        m0 = _gaussian_blur(np.abs(diff), sigma=blur_sigma)
+        if blend_mode == 'conservative':
+            blur_sigma = 3.0 + 7.0 * aggr
+            m0 = _gaussian_blur(np.abs(diff), sigma=blur_sigma)
+            g = _gradient_magnitude(_gaussian_blur(orig01, sigma=1.0))
+            g_norm = g / (np.percentile(g, 99.0) + 1e-6)
+            g_norm = np.clip(g_norm, 0.0, 1.0)
+            power = 0.5 + 1.5 * aggr
+            mask = m0 * np.power(1.0 - g_norm, power)
+            # Exclude stellar cores/bright structures
+            bright_thr = np.percentile(orig01, 98.5 - 5.0 * aggr)
+            star_core = (orig01 >= bright_thr).astype(np.float32)
+            star_core = _gaussian_blur(star_core, sigma=1.5)
+            star_edge = (g_norm > 0.6).astype(np.float32)
+            star_edge = _gaussian_blur(star_edge, sigma=1.0)
+            star_mask = np.clip(star_core + 0.5 * star_edge, 0.0, 1.0)
+            mask = mask * (1.0 - star_mask)
+            t = np.percentile(m0, 75.0 + 20.0 * aggr)
+            if np.isfinite(t) and t > 0:
+                mask = np.where(m0 >= t, mask, mask * 0.2)
+            mask = np.clip(mask * (0.5 + 0.5 * aggr), 0.0, 1.0).astype(np.float32)
+        else:  # lowfreq: only apply low-frequency component of correction
+            # Extract low-frequency correction with a broad blur
+            lf = _gaussian_blur(corr01 - orig01, sigma=8.0 + 16.0 * aggr)
+            mask = np.clip(np.abs(lf) / (np.percentile(np.abs(lf), 95.0) + 1e-6), 0.0, 1.0).astype(np.float32)
+            mask = _gaussian_blur(mask, sigma=3.0)
 
-        g = _gradient_magnitude(_gaussian_blur(orig01, sigma=1.0))
-        g_norm = g / (np.percentile(g, 99.0) + 1e-6)
-        g_norm = np.clip(g_norm, 0.0, 1.0)
-        power = 0.5 + 1.5 * aggr
-        mask = m0 * np.power(1.0 - g_norm, power)
-        t = np.percentile(m0, 75.0 + 20.0 * aggr)
-        if np.isfinite(t) and t > 0:
-            mask = np.where(m0 >= t, mask, mask * 0.2)
-        mask = np.clip(mask * (0.5 + 0.5 * aggr), 0.0, 1.0).astype(np.float32)
-        corrected_image = (image_2d.astype(np.float32) + mask * (corrected_image.astype(np.float32) - image_2d.astype(np.float32))).astype(np.float32)
+        # Residual gating so only significant per-pixel changes pass
+        mu = _gaussian_blur(orig01, sigma=1.0)
+        hf = orig01 - mu
+        var = _gaussian_blur(hf * hf, sigma=1.0)
+        local_sigma = np.sqrt(np.clip(var, 0.0, None))
+        thr = np.clip((2.5 + 2.0 * aggr) * local_sigma, 1e-4, None)
+        soft = np.clip(0.4 + 0.2 * aggr, 0.1, 1.0) * thr
+        resid = np.abs(corr01 - orig01)
+        gate = np.clip((resid - thr) / (soft + 1e-6), 0.0, 1.0).astype(np.float32)
+        final_mask = np.clip(mask * gate, 0.0, 1.0)
+        corrected_image = (image_2d.astype(np.float32) + final_mask * (corrected_image.astype(np.float32) - image_2d.astype(np.float32))).astype(np.float32)
 
     return corrected_image
 
@@ -254,10 +301,16 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         elif force_mode_str == "linear": force_mode = True
         else: force_mode = False
         
-        model = AttentionResUNet()
-        checkpoint = torch.load(model_path, map_location=device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        model.load_state_dict(state_dict, strict=True)
+        try:
+            model = AttentionResUNetFG()
+            checkpoint = torch.load(model_path, map_location=device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            model.load_state_dict(state_dict, strict=True)
+        except Exception:
+            model = AttentionResUNet()
+            checkpoint = torch.load(model_path, map_location=device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            model.load_state_dict(state_dict, strict=True)
         model.to(device)
         model.eval()
 
@@ -410,7 +463,7 @@ class FlatAICorrectorApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
         self.image_path = ctk.StringVar()
         self.model_path = ctk.StringVar(value=r"C:\Users\scdou\Documents\NeuralNet\unet_flat_checkpoint.pth")
@@ -421,6 +474,7 @@ class FlatAICorrectorApp(ctk.CTk):
         self.is_processing = False
         self.conservative_var = ctk.BooleanVar(value=True)
         self.conservative_strength = ctk.DoubleVar(value=0.7)
+        self.blend_mode_var = ctk.StringVar(value="none")  # none | conservative | lowfreq
 
         self.setup_ui()
         self.update_run_button_state()
@@ -464,12 +518,18 @@ class FlatAICorrectorApp(ctk.CTk):
         ctk.CTkCheckBox(options_frame, text="Save as float32", variable=self.save_float32_var).pack(side="left", padx=20)
         self.overwrite_checkbox = ctk.CTkCheckBox(options_frame, text="Overwrite input file", variable=self.overwrite_var, command=self.on_overwrite_toggle)
         self.overwrite_checkbox.pack(side="left", padx=5)
-        ctk.CTkCheckBox(options_frame, text="Surgical blend", variable=self.conservative_var).pack(side="left", padx=20)
-        ctk.CTkLabel(options_frame, text="Aggressiveness").pack(side="left", padx=(10, 5))
-        ctk.CTkSlider(options_frame, from_=0.0, to=1.0, number_of_steps=100, width=160, variable=self.conservative_strength).pack(side="left", padx=5)
+
+        # Separate row for surgical blend controls to avoid clipping off-screen
+        blend_frame = ctk.CTkFrame(self)
+        blend_frame.grid(row=4, column=0, padx=20, pady=(0, 10), sticky="ew")
+        blend_frame.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(blend_frame, text="Blend mode").grid(row=0, column=0, padx=(10, 5), pady=10, sticky="w")
+        ctk.CTkOptionMenu(blend_frame, variable=self.blend_mode_var, values=["none", "conservative", "lowfreq"]).grid(row=0, column=1, padx=(5, 10), pady=10, sticky="w")
+        ctk.CTkLabel(blend_frame, text="Aggressiveness").grid(row=0, column=2, padx=(10, 5), pady=10, sticky="e")
+        ctk.CTkSlider(blend_frame, from_=0.0, to=1.0, number_of_steps=100, variable=self.conservative_strength).grid(row=0, column=3, padx=(5, 10), pady=10, sticky="ew")
 
         processing_frame = ctk.CTkFrame(self)
-        processing_frame.grid(row=4, column=0, padx=20, pady=10, sticky="nsew")
+        processing_frame.grid(row=5, column=0, padx=20, pady=10, sticky="nsew")
         processing_frame.grid_columnconfigure(0, weight=1)
 
         self.run_button = ctk.CTkButton(processing_frame, text="Start Flat-Field Correction", command=self.start_correction)

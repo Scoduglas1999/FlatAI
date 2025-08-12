@@ -8,7 +8,7 @@ from tqdm import tqdm
 import time
 
 # We assume the model architecture is defined in unet_model.py
-from unet_model import AttentionResUNet
+from unet_model import AttentionResUNet, AttentionResUNetFG
 
 # Handle potential missing imports
 try:
@@ -42,6 +42,9 @@ TILE_OVERLAP = 48  # How much the tiles should overlap to avoid edge artifacts
 USE_GLOBAL_NORMALIZATION = True  # use global robust normalization to reduce seams/brightness drift
 ENABLE_CONSERVATIVE_BLEND = True  # blend output with input to make surgical corrections
 CONSERVATIVE_STRENGTH = 0.7  # 0..1, higher = stronger corrections
+ENABLE_RESIDUAL_GATING = True   # apply residual thresholding so only significant pixels change
+RESIDUAL_SIGMA = 3.0            # threshold in local sigma units
+RESIDUAL_SOFTNESS = 0.5         # softness factor (fraction of threshold) for smooth ramp
 
 # =============================================================================
 # --- 2. HELPER FUNCTIONS ---
@@ -53,7 +56,19 @@ def load_trained_unet(model_path, device):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
-    model = AttentionResUNet()
+    # Try FG variant first; fall back to image-output model
+    try:
+        model = AttentionResUNetFG()
+        checkpoint = torch.load(model_path, map_location=device)
+        state = checkpoint.get('model_state_dict', checkpoint)
+        model.load_state_dict(state, strict=True)
+        model.to(device)
+        model.eval()
+        print("   Loaded FG model (F,G).")
+        return model
+    except Exception:
+        print("   FG weights not compatible; falling back to image-output model.")
+        model = AttentionResUNet()
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     model.to(device)
@@ -203,6 +218,30 @@ def conservative_blend(original: np.ndarray, corrected: np.ndarray, aggressivene
 
     return (original + mask * (corrected - original)).astype(np.float32)
 
+def residual_gated_merge(original: np.ndarray, corrected: np.ndarray,
+                         sigma_coeff: float = RESIDUAL_SIGMA,
+                         softness: float = RESIDUAL_SOFTNESS) -> np.ndarray:
+    # Work in robust [0,1] domain
+    p_lo, p_hi = np.percentile(original, [0.5, 99.5])
+    if not np.isfinite(p_lo) or not np.isfinite(p_hi) or p_hi <= p_lo:
+        p_lo, p_hi = float(np.min(original)), float(np.max(original))
+        if p_hi <= p_lo:
+            return corrected
+    orig01 = np.clip((original - p_lo) / (p_hi - p_lo), 0.0, 1.0).astype(np.float32)
+    corr01 = np.clip((corrected - p_lo) / (p_hi - p_lo), 0.0, 1.0).astype(np.float32)
+
+    diff = corr01 - orig01
+    # Local sigma from variance of high-frequency residual
+    mu = _gaussian_blur(orig01, sigma=1.0)
+    hf = orig01 - mu
+    var = _gaussian_blur(hf * hf, sigma=1.0)
+    local_sigma = np.sqrt(np.clip(var, 0.0, None))
+    thr = np.clip(sigma_coeff * local_sigma, 1e-4, None)
+    soft = np.clip(softness, 1e-4, 1.0) * thr
+    gate = np.clip((np.abs(diff) - thr) / (soft + 1e-6), 0.0, 1.0).astype(np.float32)
+
+    return (original + gate * (corrected - original)).astype(np.float32)
+
 def rescale_tile_to_original_range(corrected_tile, original_tile):
     """
     Rescales the corrected tile to match the brightness range of the original tile.
@@ -257,10 +296,27 @@ def _process_single_channel(image_2d, model, device):
                 input_tensor, used_min, used_max = preprocess_tile(tile, global_min, global_max)
                 input_tensor = input_tensor.to(device)
                 with torch.no_grad():
-                    corrected_tensor = model(input_tensor)
-                    # Clamp model output to the trained range to avoid saturation/clipping artifacts
-                    corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
-                corrected01 = postprocess_tile(corrected_tensor)
+                    # Support both model types
+                    out = model(input_tensor)
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        # FG model: invert to clean tile in [0,1], optionally with confidence M
+                        if len(out) == 3:
+                            F_pred, G_pred, M_pred = out
+                        else:
+                            F_pred, G_pred = out
+                            M_pred = None
+                        tile01 = np.clip((tile - used_min) / (used_max - used_min + 1e-6), 0.0, 1.0)
+                        tile01_t = torch.from_numpy(tile01).unsqueeze(0).unsqueeze(0).to(device)
+                        y_clean01_u = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                        if M_pred is not None:
+                            y_clean01 = torch.clamp(tile01_t + M_pred * (y_clean01_u - tile01_t), 0.0, 1.0)
+                        else:
+                            y_clean01 = y_clean01_u
+                        corrected01 = y_clean01.squeeze().cpu().numpy().astype(np.float32)
+                    else:
+                        corrected_tensor = out
+                        corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
+                        corrected01 = postprocess_tile(corrected_tensor)
                 corrected = corrected01 * (used_max - used_min) + used_min
             corrected_image[y:y+TILE_SIZE, x:x+TILE_SIZE] += corrected * window
             weight_map[y:y+TILE_SIZE, x:x+TILE_SIZE] += window
@@ -270,6 +326,8 @@ def _process_single_channel(image_2d, model, device):
     corrected_image /= weight_map
     if ENABLE_CONSERVATIVE_BLEND:
         corrected_image = conservative_blend(image_2d.astype(np.float32), corrected_image.astype(np.float32), CONSERVATIVE_STRENGTH)
+    if ENABLE_RESIDUAL_GATING:
+        corrected_image = residual_gated_merge(image_2d.astype(np.float32), corrected_image.astype(np.float32))
     return corrected_image.astype(np.float32)
 
 # =============================================================================
