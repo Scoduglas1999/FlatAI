@@ -1,6 +1,6 @@
 # FlatAI - Synthetic Flat Frames Done In Seconds Using Neural Networks
 
-**Flat-Correction-AI** is a deep learning-based framework for advanced correction of optical artifacts in astrophotography images. This repository details a state-of-the-art approach that goes beyond simple image-to-image translation, instead modeling the physical processes of image degradation to achieve superior correction quality. The system is designed to remove a wide range of common artifacts, including vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, effectively eliminating the need for traditional flat-field calibration frames.
+**FlatAI** is a deep learning-based framework for advanced correction of optical artifacts in astrophotography images. This repository details a state-of-the-art approach that goes beyond simple image-to-image translation, instead modeling the physical processes of image degradation to achieve superior correction quality. The system is designed to remove a wide range of common artifacts, including vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, effectively eliminating the need for traditional flat-field calibration frames.
 
 ## Abstract
 
@@ -129,8 +129,8 @@ $L_{total} = \lambda_{L1} L_{L1} + \lambda_{LPIPS} L_{LPIPS} + \lambda_{Style} L
 Clone the repository and install the necessary packages. A `requirements.txt` is not yet provided, but key dependencies include `torch`, `torchvision`, `numpy`, `astropy`, `matplotlib`, `tqdm`, and `lpips`.
 
 ```bash
-git clone https://github.com/your-username/Flat-Correction-AI.git
-cd Flat-Correction-AI
+git clone https://github.com/your-username/FlatAI.git
+cd FlatAI
 pip install torch torchvision numpy astropy matplotlib tqdm lpips
 ```
 
