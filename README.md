@@ -18,7 +18,7 @@ Where:
 -   $F_{mult}$ is the **multiplicative flat-field**, a 2D map representing artifacts like vignetting, dust motes, and photo-response non-uniformity (PRNU). Values in this field are typically centered around 1.0.
 -   $G_{add}$ is the **additive gradient field**, a 2D map representing artifacts like amplifier glow and linear gradients, which are independent of the image signal.
 
-Our network is designed to predict $F_{mult}$ and $G_{add}$ directly, allowing for a physically-motivated correction.
+The network is designed to predict $F_{mult}$ and $G_{add}$ directly, allowing for a physically-motivated correction.
 
 ## Model Architecture: `AttentionResUNetFG`
 
