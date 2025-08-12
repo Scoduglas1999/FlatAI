@@ -1,83 +1,48 @@
-# FlatAI: An Advanced Deep Learning Approach to Astrophotography Image Correction
+# Flat-Correction-AI
 
-**FlatAI** is a sophisticated, 40-million-parameter U-Net based neural network designed to tackle complex image correction tasks in astrophotography. The project has evolved through two primary phases:
+**Flat-Correction-AI** is a deep learning-based framework for advanced correction of optical artifacts in astrophotography images. This repository details a state-of-the-art approach that goes beyond simple image-to-image translation, instead modeling the physical processes of image degradation to achieve superior correction quality. The system is designed to remove a wide range of common artifacts, including vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, effectively eliminating the need for traditional flat-field calibration frames.
 
-1.  **Synthetic Flat-Frame Generation:** The current focus of the project. The model learns to remove artifacts like dust motes, vignetting, and uneven illumination from astronomical images, effectively creating a perfect "flat frame" on the fly.
-2.  **Optical Aberration Correction (Physics-Informed):** The original goal. This version of the model was a Physics-Informed Neural Network (PINN) trained to correct optical aberrations like coma by simulating and then reversing them.
+## Abstract
 
-This repository contains the code for both approaches, but do note that a significant portion of this project is for personal learning and experimentation.
+Traditional flat-field correction in astrophotography relies on capturing dedicated calibration frames, a process that is often tedious and prone to error. This project introduces a novel deep learning paradigm that circumvents this requirement. We propose a specially designed U-Net architecture, `AttentionResUNetFG`, which, instead of mapping a corrupted image directly to a clean one, learns to deconstruct the image into its constituent physical components. The model explicitly predicts the multiplicative flat-field ($F_{mul}$) and the additive gradient field ($G_{add}$) that corrupt the true astronomical signal ($I_{true}$). This is achieved by training the network with a sophisticated, multi-component loss function that includes perceptual, style, and physics-informed terms, ensuring both high-fidelity reconstruction and physical consistency. The result is a robust system capable of producing high-quality, artifact-free images from a single input frame.
 
-While looking at the project you may realize that some files seem disjointed, superfluous, or you may notice that there is bad code in some. This is because I have not been culling files as they become unnecessary like I would on a real public project. In the end, I may release the final model once done training, but that day is not today, so browse this repo with caution understanding much of it can seem random at times.
+## The Physical Model of Image Degradation
 
-Training samples will be added in batches as I continue working. I likely will not be uploading each one as they finish, but likely there will be more at least once a day if improvement warrants it.
+The image formation process in the presence of flat-field artifacts can be described by the following equation:
 
-## Table of Contents
-* [The "Flat-Field" Problem in Astrophotography](#the-flat-field-problem-in-astrophotography)
-* [The "Optical Aberration" Problem](#the-optical-aberration-problem)
-* [Project Evolution and Challenges](#project-evolution-and-challenges)
-* [Model Architecture](#model-architecture)
-* [Models and Training](#models-and-training)
-  * [1. Flat-Field Correction Model](#1-flat-field-correction-model)
-  * [2. Optical Aberration (PINN) Model](#2-optical-aberration-pinn-model)
-* [Usage](#usage)
-  * [1. Setup](#1-setup)
-  * [2. Dataset Generation](#2-dataset-generation)
-  * [3. Training](#3-training)
-  * [4. Inference](#4-inference)
-* [Future Work](#future-work)
-
-## The "Flat-Field" Problem in Astrophotography
-
-A "flat frame" is a calibration image used to correct for imperfections in the optical train of a telescope (e.g., dust on the sensor, vignetting from the telescope optics). These imperfections create a fixed pattern of "shadows" and brightness variations on every image taken. By dividing the astronomical image by a flat frame, these artifacts can be removed.
-
-However, taking high-quality flat frames can be difficult and time-consuming. **FlatAI** aims to solve this by learning the *characteristics* of these artifacts and removing them directly from the science image, eliminating the need for a separate flat frame.
-
-The image formation model for flat-fielding is as follows:
-
-$$I_{\text{observed}} = (I_{\text{true}} \times F_{\text{mult}}) + G_{\text{add}}$$
+$I_{observed} = (I_{true} \times F_{mult}) + G_{add}$
 
 Where:
-- $I_{\text{observed}}$ is the final image captured by the sensor.
-- $I_{\text{true}}$ is the "perfect" image of the astronomical object.
-- $F_{\text{mult}}$ is the multiplicative flat-field, containing artifacts like vignetting and dust motes.
-- $G_{\text{add}}$ is the additive gradient field, containing artifacts like amplifier glow and linear gradients.
+-   $I_{observed}$ is the final image captured by the sensor.
+-   $I_{true}$ is the "perfect" image of the astronomical object.
+-   $F_{mult}$ is the **multiplicative flat-field**, a 2D map representing artifacts like vignetting, dust motes, and photo-response non-uniformity (PRNU). Values in this field are typically centered around 1.0.
+-   $G_{add}$ is the **additive gradient field**, a 2D map representing artifacts like amplifier glow and linear gradients, which are independent of the image signal.
 
-## The "Optical Aberration" Problem
+Our network is designed to predict $F_{mult}$ and $G_{add}$ directly, allowing for a physically-motivated correction.
 
-Optical aberrations are distortions in an image caused by the physical properties of the lenses and mirrors in a telescope. Aberrations like coma, astigmatism, and chromatic aberration can deform stars and reduce image sharpness, especially towards the edges of the field of view.
+## Model Architecture: `AttentionResUNetFG`
 
-The initial version of this project (now located in the `optical_aberration` directory) was designed as a Physics-Informed Neural Network (PINN) to correct these aberrations. It used Zernike polynomials to mathematically model the aberrations, generate a dataset of "perfect" vs. "aberrated" images, and then train a network to reverse the distortion.
+The core of this project is the `AttentionResUNetFG`, a variant of the popular U-Net architecture enhanced with several key features:
 
-The image formation model for optical aberrations is a convolution:
-
-$$I_{\text{observed}} = I_{\text{true}} * \text{PSF}$$
-
-Where:
-- $I_{\text{observed}}$ is the blurry image captured by the sensor.
-- $I_{\text{true}}$ is the "perfect" sharp image.
-- $\text{PSF}$ is the Point Spread Function, which represents the optical aberration.
-
-### Project Evolution and Challenges
-
-While the PINN approach for aberration correction showed promise, it encountered several challenges:
-
-*   **Noise Amplification:** The model would sometimes amplify background noise in an attempt to sharpen stars.
-*   **Artifact Generation:** It could create unnatural-looking dark rings or other artifacts around stars.
-*   **"Cheating" the Loss Function:** The model found ways to slightly improve its loss score by making non-physical changes to the image, rather than truly correcting the aberrations.
-
-Due to these challenges, the project pivoted to focus on the more constrained, but equally important, problem of flat-field correction.
-
-## Model Architecture
-
-The core of the project is an Attention-based Residual U-Net (`unet_model.py`). This architecture uses residual blocks to prevent vanishing gradients and attention gates to focus on salient features from the skip connections.
+1.  **Residual Blocks:** The standard convolutional blocks are replaced with residual blocks (`ResidualBlock`) to facilitate the training of a deeper network and mitigate the vanishing gradient problem.
+2.  **Attention Gates:** Attention gates are integrated into the decoder's skip connections. This allows the model to selectively focus on the most relevant features from the encoder path, improving reconstruction accuracy.
+3.  **Multi-Headed Output:** The network has three output heads, predicting:
+    -   $F_{mul}$: The multiplicative field.
+    -   $G_{add}$: The additive field.
+    -   $M$: A **confidence map**, which the model uses to modulate the strength of the correction. This prevents the model from altering parts of the image that are already clean.
+4.  **Spatially-Aware Input:** The model receives four input channels: the affected image, two normalized coordinate channels (`xx`, `yy`), and a dynamically generated local noise map. This provides the network with global spatial context and helps it differentiate between signal, noise, and artifacts.
 
 <details>
 <summary>Click to expand a diagram of the model architecture</summary>
 
 ```mermaid
 graph TD
+    subgraph Input
+        A[Image + Coords + Noise]
+    end
+
     subgraph Encoder
-        A[Input] --> B(enc1: ResBlock 1->64);
+        A --> B(enc1: ResBlock 4->64);
         B --> C{pool1: MaxPool2d};
         C --> D(enc2: ResBlock 64->128);
         D --> E{pool2: MaxPool2d};
@@ -120,117 +85,79 @@ graph TD
             X --> Y;
         end
         Y --> Z(dec_combine1: ResBlock 128->64);
-        Z --> AA(out_conv: Conv2d 64->1);
-        AA --> BB[Output];
+    end
+    
+    subgraph Output Heads
+        Z --> AA(out_conv: Conv2d 64->3);
+        AA --> BB[F_mul prediction];
+        AA --> CC[G_add prediction];
+        AA --> DD[M (confidence) prediction];
     end
 ```
 </details>
 
-## Models and Training
+## Synthetic Data Generation
 
-Two separate training workflows are provided, one for each of the project's goals.
+A robust model requires a diverse and realistic dataset. The `create_flat_dataset.py` script generates a large-scale synthetic dataset by applying procedurally generated artifacts to a collection of clean, high-quality astronomical images.
 
-### 1. Flat-Field Correction Model
+The generation process includes:
+-   **Multiplicative Artifacts ($F_{mult}$):**
+    -   **Vignetting:** Parametrized radial gradients.
+    -   **Dust Motes:** A sophisticated generator for creating realistic dust motes, including soft, hard, and donut-shaped occlusions with irregular edges.
+    -   **PRNU:** Low-frequency, noise-like patterns simulating sensor non-uniformity.
+-   **Additive Artifacts ($G_{add}$):**
+    -   **Linear Gradients:** Simulating uneven skyglow or light pollution.
+    -   **Amplifier Glow:** Exponential glow originating from the corners of the image.
 
-*   **Training Script:** `train_unet_flat.py`
-*   **Dataset Generator:** `create_flat_dataset.py`
+The script also employs a **curriculum learning** strategy, gradually increasing the intensity and complexity of the artifacts as more data is generated. This helps the model learn basic corrections before tackling more challenging examples.
 
-This model is trained on a synthetic dataset of images with procedurally generated flat-field artifacts. The `create_flat_dataset.py` script takes a directory of "perfect" astronomical images and applies a variety of effects:
+## Training and Loss Function
 
-*   **Multiplicative Artifacts (Flat Field):**
-    *   Vignetting (darker/brighter corners)
-    *   Dust motes (dark, light, in-focus, out-of-focus)
-    *   Photo-Response Non-Uniformity (PRNU)
-*   **Additive Artifacts (Gradient Field):**
-    *   Linear gradients
-    *   Amplifier glow
+The model is trained to minimize a composite loss function, carefully designed to balance reconstruction accuracy with perceptual quality and physical realism.
 
-The model is then trained to take an "affected" image and reproduce the "perfect" ground-truth image.
+$L_{total} = \lambda_{L1} L_{L1} + \lambda_{LPIPS} L_{LPIPS} + \lambda_{Style} L_{Style} + \lambda_{Physics} L_{Physics} + L_{Priors}$
 
-#### Loss Function
-
-The flat-field model uses a sophisticated multi-part loss function to ensure high-fidelity results:
-
-```
-L_total = λ_L1 × L_L1 + λ_LPIPS × L_LPIPS + λ_Style × L_Style + λ_Physics × L_Physics
-```
-
-Where:
-- **L_L1**: A pixel-level L1 loss for basic reconstruction accuracy.
-- **L_LPIPS**: The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better captures human perception of image similarity.
-- **L_Style**: A VGG-based style loss calculated from the Gram matrix of feature maps. This loss helps to preserve the texture of the original image.
-- **L_Physics**: A physics-consistency loss. The model's output **I_pred** is fed back into the forward physics model to reconstruct the observed image: **I_reconstructed** = (**I_pred** × **F_mult**) + **G_add**. The loss is the L1 distance between **I_reconstructed** and the original **I_observed**.
-
-### 2. Optical Aberration (PINN) Model
-
-*   **Training Script:** `optical_aberration/train_unet_pinn.py`
-*   **Dataset Generator:** `optical_aberration/create_pinn_dataset.py`
-
-This model attempts to deconvolve the Point Spread Function (PSF) caused by optical aberrations. The `create_pinn_dataset.py` script works as follows:
-
-1.  **Aberration Modeling:** It uses Zernike polynomials to model optical aberrations (specifically, coma) across the field of view of a simulated telescope.
-2.  **PSF Generation:** For any given point in the image, it can generate a unique PSF that represents the aberration at that location.
-3.  **Dataset Creation:** It takes "perfect" images, convolves them with the generated PSFs to create "blurry" versions, and saves the sharp/blurry/PSF triplets.
-
-#### Loss Function
-
-The PINN model also uses a multi-part loss function, similar to the flat-field model, but with a different physics-informed component:
-
-```
-L_total = λ_L1 × L_L1 + λ_LPIPS × L_LPIPS + λ_Style × L_Style + λ_Physics × L_Physics
-```
-
--   **L_Physics**: The physics-informed loss here is a re-convolution loss. The model's "corrected" (sharpened) output **I_pred** is convolved with the original PSF: **I_reblurred** = **I_pred** * **PSF**. The loss is the L1 distance between **I_reblurred** and the original blurry input **I_observed**.
+-   **$L_{L1}$:** Standard L1 pixel-wise loss between the corrected and ground-truth images.
+-   **$L_{LPIPS}$:** The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better aligns with human perception of image quality.
+-   **$L_{Style}$:** A VGG-based style loss that preserves the texture of the original image by comparing the Gram matrices of feature maps.
+-   **$L_{Physics}$:** A **physics-informed consistency loss**. After the model predicts a clean image $I_{pred}$, this image is fed *back* into the forward physics model using the predicted fields $F_{pred}$ and $G_{pred}$. The result is compared to the original input image $I_{observed}$. This forces the model to learn the true degradation process, not just an arbitrary image-to-image mapping.
+-   **$L_{Priors}$:** A set of regularization terms that impose physically-motivated constraints, such as smoothness on the predicted fields and penalties for altering already-clean regions of the image.
 
 ## Usage
 
 ### 1. Setup
+Clone the repository and install the necessary packages. A `requirements.txt` is not yet provided, but key dependencies include `torch`, `torchvision`, `numpy`, `astropy`, `matplotlib`, `tqdm`, and `lpips`.
 
-Clone the repository and install the required Python packages:
 ```bash
-git clone https://github.com/your-username/FlatAI.git
-cd FlatAI
-pip install -r requirements.txt
+git clone https://github.com/your-username/Flat-Correction-AI.git
+cd Flat-Correction-AI
+pip install torch torchvision numpy astropy matplotlib tqdm lpips
 ```
 
 ### 2. Dataset Generation
-
-First, you need to populate the `sharp_images` directory with high-quality, artifact-free astronomical images. FITS, XISF, JPG, and PNG formats are supported.
-
-**To generate the flat-field dataset:**
-```bash
-python create_flat_dataset.py
-```
-
-**To generate the optical aberration (PINN) dataset:**
-```bash
-python optical_aberration/create_pinn_dataset.py
-```
-These scripts will create `randomized_flat_dataset` and `randomized_pinn_dataset` directories, respectively.
+1.  Populate the `sharp_images/` directory with high-quality, artifact-free astronomical images (FITS, PNG, or JPG).
+2.  Run the dataset generation script:
+    ```bash
+    python create_flat_dataset.py
+    ```
+    This will create the `randomized_flat_dataset/` directory containing training and validation data.
 
 ### 3. Training
-
-You can train either model using its corresponding script. Both scripts support resuming from a checkpoint.
-
-**To train the flat-field model:**
+To train the model, run the main training script. Training will automatically resume from a checkpoint if one is found.
 ```bash
 python train_unet_flat.py
 ```
-
-**To train the PINN model:**
-```bash
-python optical_aberration/train_unet_pinn.py
-```
-Training progress (including sample images and loss curves) will be saved to the `flat_training_samples` or `pinn_training_samples` directories.
+Training progress, including sample images and a loss curve, will be saved to the `flat_training_samples/` directory.
 
 ### 4. Inference
-
-*   **Flat-Field Correction:** Use `gui_corrector.py` for a graphical interface to correct images with the flat-field model.
-*   **Aberration Correction:** Use `optical_aberration/correct_image.py` to apply the aberration correction model.
+A graphical user interface is provided for applying the trained model to new images.
+```bash
+python gui_corrector_final.py
+```
 
 ## Future Work
+-   **Hyperparameter Optimization:** A systematic search for the optimal weights ($\lambda$) of the loss components could further improve results.
+-   **Combined Aberration and Flat Correction:** The architecture could be extended to simultaneously correct for optical aberrations (like coma and astigmatism) in addition to flat-field artifacts.
 
-*   **Combined Model:** A single model could be trained to correct both flat-field artifacts and optical aberrations simultaneously.
-*   **Real-World Data:** The models are currently trained purely on synthetic data. Fine-tuning on real-world "before and after" images could improve performance.
-*   **Hyperparameter Optimization:** A more systematic search for optimal loss weights and other hyperparameters could yield better results.
-*   **User Interface:** The existing GUI for the flat-field model could be expanded to include the aberration correction model.
+## License
+This project is licensed under the MIT License. See the `LICENSE` file for details.
