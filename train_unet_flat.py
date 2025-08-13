@@ -126,14 +126,14 @@ USE_AMP = True  # mixed precision for speed/stability on CUDA
 
 # Loss weights (base)
 LAMBDA_PHYSICS = 2.0     # consistency with flat-field forward model
-LAMBDA_LPIPS = 1.0
-LAMBDA_L1 = 0.15
-LAMBDA_STYLE = 2e3
+LAMBDA_LPIPS = 1.5
+LAMBDA_L1 = 1.0
+LAMBDA_STYLE = 0.0 # Disabled
 
 # Warmup (steps)
 WARMUP_PHYS_STEPS = 500
 WARMUP_LPIPS_STEPS = 1000
-WARMUP_STYLE_STEPS = 5000
+WARMUP_STYLE_STEPS = 0 # Disabled
 
 # Scheduler settings
 SCHEDULER_PATIENCE = 10
@@ -283,9 +283,16 @@ def main():
             with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
                 # Build absolute coordinate channels for global context
                 b, _, h, w = affected.shape
+                # Approximate local noise sigma from high-frequency energy of the normalized input
+                with torch.no_grad():
+                    y_obs_for_noise = torch.clamp((affected + 1.0) / 2.0, 0.0, 1.0)
+                    mu = F.avg_pool2d(y_obs_for_noise, kernel_size=3, stride=1, padding=1)
+                    hf = y_obs_for_noise - mu
+                    var = F.avg_pool2d(hf * hf, kernel_size=3, stride=1, padding=1)
+                    sigma = torch.sqrt(torch.clamp(var, 1e-6))
                 yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
                 xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
-                affected_in = torch.cat([affected, xx, yy], dim=1)
+                affected_in = torch.cat([affected, xx, yy, sigma], dim=1)
                 F_pred, G_pred, M_pred = model(affected_in)
                 # Reconstruct clean target using forward model inversion
                 # Inputs/targets in [-1,1] => map to [0,1] first
@@ -301,7 +308,7 @@ def main():
                 loss_l1 = l1_criterion(pred, sharp)
             # LPIPS and Style in FP32 for stability
             loss_lpips = compute_lpips_fp32(lpips_loss_fn, pred, sharp)
-            loss_style = style_criterion(pred, sharp)
+            loss_style = torch.tensor(0.0, device=device)
 
             # Physics consistency: forward model must reproduce affected
             with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
@@ -345,9 +352,9 @@ def main():
                      (LAMBDA_LPIPS * wl) * loss_lpips +
                      (LAMBDA_PHYSICS * wp) * loss_physics +
                      (LAMBDA_STYLE * ws) * loss_style +
-                     0.2 * loss_weighted_fid +
-                     0.5 * loss_identity +
-                     0.1 * loss_conf_clean +
+                     0.5 * loss_weighted_fid +
+                     5.0 * loss_identity + # Increased from 2.0
+                     2.0 * loss_conf_clean + # Increased from 1.0
                      0.05 * loss_F_mean +
                      0.1 * loss_smooth)
 
@@ -387,9 +394,15 @@ def main():
 
                 with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
                     b, _, h, w = affected.shape
+                    with torch.no_grad():
+                        y_obs_for_noise = torch.clamp((affected + 1.0) / 2.0, 0.0, 1.0)
+                        mu = F.avg_pool2d(y_obs_for_noise, kernel_size=3, stride=1, padding=1)
+                        hf = y_obs_for_noise - mu
+                        var = F.avg_pool2d(hf * hf, kernel_size=3, stride=1, padding=1)
+                        sigma = torch.sqrt(torch.clamp(var, 1e-6))
                     yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
                     xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
-                    affected_in = torch.cat([affected, xx, yy], dim=1)
+                    affected_in = torch.cat([affected, xx, yy, sigma], dim=1)
                     F_pred, G_pred, M_pred = model(affected_in)
                     y_obs = torch.clamp((affected + 1.0) / 2.0, 0.0, 1.0)
                     y_true = torch.clamp((sharp + 1.0) / 2.0, 0.0, 1.0)
@@ -398,7 +411,7 @@ def main():
                     pred = y_clean * 2.0 - 1.0
                     loss_l1 = l1_criterion(pred, sharp)
                 loss_lpips = compute_lpips_fp32(lpips_loss_fn, pred, sharp)
-                loss_style = style_criterion(pred, sharp)
+                loss_style = torch.tensor(0.0, device=device)
                 with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
                     y_clean01 = torch.clamp((pred + 1.0) / 2.0, 0.0, 1.0)
                     re_obs01 = torch.clamp(y_clean01 * F_pred + G_pred, 0.0, 1.0)
@@ -424,9 +437,9 @@ def main():
                              LAMBDA_LPIPS * loss_lpips +
                              LAMBDA_PHYSICS * loss_physics +
                              LAMBDA_STYLE * loss_style +
-                             0.2 * loss_weighted_fid +
-                             0.5 * loss_identity +
-                             0.1 * loss_conf_clean +
+                             0.5 * loss_weighted_fid +
+                             5.0 * loss_identity + # Increased from 2.0
+                             2.0 * loss_conf_clean + # Increased from 1.0
                              0.05 * loss_F_mean +
                              0.1 * loss_smooth)
                 running_val += total_val.item()

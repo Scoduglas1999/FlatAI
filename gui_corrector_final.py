@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from astropy.io import fits
 import time
+import torch.nn.functional as F
 
 # Force astropy to use a more forgiving encoding for FITS headers
 # to prevent crashes on non-standard metadata.
@@ -83,6 +84,44 @@ def preprocess_tile(tile_np, global_min=None, global_max=None):
     tile_normalized = tile_normalized_01 * 2.0 - 1.0
     tile_tensor = torch.from_numpy(tile_normalized.astype(np.float32)).unsqueeze(0).unsqueeze(0)
     return tile_tensor, (global_min, global_max) if global_min is not None else (tile_np.min(), tile_np.max())
+
+def preprocess_tile_fg(tile_np, device, global_min=None, global_max=None):
+    """Prepares a 4-channel tensor for the FG model, using global normalization if provided."""
+    h, w = tile_np.shape
+    
+    if global_min is not None and global_max is not None:
+        pmin, pmax = global_min, global_max
+    else:
+        # Fallback to per-tile percentile normalization for non-linear images
+        pmin, pmax = np.percentile(tile_np, 1), np.percentile(tile_np, 99)
+
+    if pmax > pmin:
+        tile_01 = (tile_np - pmin) / (pmax - pmin)
+    else:
+        tile_01 = np.zeros_like(tile_np)
+    
+    tile_01 = np.clip(tile_01, 0, 1)
+    tile_norm11 = torch.from_numpy(tile_01.astype(np.float32) * 2.0 - 1.0).to(device)
+
+    # Coords and noise
+    yy, xx = torch.meshgrid(
+        torch.linspace(0, 1, h, device=device),
+        torch.linspace(0, 1, w, device=device),
+        indexing='ij'
+    )
+    mu = F.avg_pool2d(tile_norm11.view(1,1,h,w), kernel_size=3, stride=1, padding=1)
+    hf = tile_norm11.view(1,1,h,w) - mu
+    var = F.avg_pool2d(hf * hf, kernel_size=3, stride=1, padding=1)
+    sigma = torch.sqrt(torch.clamp(var, 1e-6))
+
+    # Combine to [B,C,H,W]
+    return torch.cat([
+        tile_norm11.view(1, 1, h, w),
+        xx.view(1, 1, h, w),
+        yy.view(1, 1, h, w),
+        sigma
+    ], dim=1), (pmin, pmax)
+
 
 def postprocess_tile(tile_tensor, norm_range):
     tile_np = tile_tensor.squeeze(0).squeeze(0).cpu().detach().numpy()
@@ -173,28 +212,29 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
             if padded_tile.std() < 1e-8:
                 corrected_padded_tile = padded_tile.copy()
             else:
-                input_tensor, norm_range = preprocess_tile(padded_tile, global_min, global_max)
-                input_tensor = input_tensor.to(device)
+                input_tensor, norm_range = preprocess_tile_fg(padded_tile, device, global_min, global_max)
                 with torch.no_grad():
                     out = model(input_tensor)
                     if isinstance(out, tuple) and len(out) >= 2:
-                        if len(out) == 3:
-                            F_pred, G_pred, M_pred = out
-                        else:
-                            F_pred, G_pred = out
-                            M_pred = None
+                        F_pred, G_pred, M_pred = out if len(out) == 3 else (*out, None)
+                        
                         pmin, pmax = norm_range
-                        base_min = pmin if pmin is not None else float(padded_tile.min())
-                        base_max = pmax if pmax is not None else float(padded_tile.max())
-                        tile01 = np.clip((padded_tile - base_min) / (base_max - base_min + 1e-6), 0.0, 1.0)
+                        tile01 = np.clip((padded_tile - pmin) / (pmax - pmin + 1e-6), 0.0, 1.0)
                         tile01_t = torch.from_numpy(tile01).unsqueeze(0).unsqueeze(0).to(device)
-                        y_clean01_u = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+
+                        y_clean_ungated = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                        
                         if M_pred is not None:
-                            y_clean01 = torch.clamp(tile01_t + M_pred * (y_clean01_u - tile01_t), 0.0, 1.0)
+                            y_clean_res = torch.clamp(tile01_t + M_pred * (y_clean_ungated - tile01_t), 0.0, 1.0)
                         else:
-                            y_clean01 = y_clean01_u
-                        corrected_padded_tile = y_clean01.squeeze().cpu().numpy().astype(np.float32)
+                            y_clean_res = y_clean_ungated
+                        
+                        corrected_padded_tile = y_clean_res.squeeze().cpu().numpy().astype(np.float32)
+                        
+                        # Denormalize
+                        corrected_padded_tile = corrected_padded_tile * (pmax - pmin) + pmin
                     else:
+                        # Fallback for old model type, though FG is standard now
                         corrected_tensor = out
                         corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
                         corrected_padded_tile = postprocess_tile(corrected_tensor, norm_range)
@@ -301,16 +341,15 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         elif force_mode_str == "linear": force_mode = True
         else: force_mode = False
         
-        try:
-            model = AttentionResUNetFG()
-            checkpoint = torch.load(model_path, map_location=device)
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
-            model.load_state_dict(state_dict, strict=True)
-        except Exception:
-            model = AttentionResUNet()
-            checkpoint = torch.load(model_path, map_location=device)
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
-            model.load_state_dict(state_dict, strict=True)
+        model = AttentionResUNetFG()
+        checkpoint = torch.load(model_path, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Filter out unexpected keys for robustness
+        model_keys = set(model.state_dict().keys())
+        filtered_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+        
+        model.load_state_dict(filtered_dict, strict=False) # Use non-strict to ignore missing keys
         model.to(device)
         model.eval()
 

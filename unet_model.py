@@ -14,18 +14,17 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate=0.2): # Add dropout_rate
         super().__init__()
 
-        # Main path with Reflection Padding
+        # Main path
         self.main_path = nn.Sequential(
             nn.ReflectionPad2d(1),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(dropout_rate),
             nn.ReflectionPad2d(1),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(out_channels)
         )
-
-        self.main_path.add_module("dropout", nn.Dropout2d(dropout_rate)) # Add Dropout
 
         # Shortcut path
         self.shortcut = nn.Sequential()
@@ -207,37 +206,12 @@ class AttentionResUNetFG(nn.Module):
         self.register_buffer('max_log_F', torch.tensor(float(math.log(max_flat_scale))), persistent=False)
 
     def forward(self, x):
-        # Accepts either:
-        #  - [B,1,H,W] image in [-1,1]; coords/noise computed internally per tile
-        #  - [B,3,H,W] image + absolute xx,yy in [0,1]
-        #  - [B,4,H,W] image + xx,yy + noise sigma map in [0,1]
-        if x.dim() != 4:
-            raise ValueError("Input must be [B,C,H,W]")
-        b, c, h, w = x.shape
-        device = x.device
-
-        img = x[:, 0:1, :, :]
-        if c >= 3:
-            xx = x[:, 1:2, :, :]
-            yy = x[:, 2:3, :, :]
-        else:
-            yy = torch.linspace(0.0, 1.0, steps=h, device=device).view(1, 1, h, 1).expand(b, -1, -1, w)
-            xx = torch.linspace(0.0, 1.0, steps=w, device=device).view(1, 1, 1, w).expand(b, -1, h, -1)
-
-        if c == 4:
-            sigma = x[:, 3:4, :, :]
-        else:
-            # Approximate local noise sigma from high-frequency energy of the normalized input
-            x01 = torch.clamp((img + 1.0) / 2.0, 0.0, 1.0)
-            mu = F.avg_pool2d(x01, kernel_size=3, stride=1, padding=1)
-            hf = x01 - mu
-            var = F.avg_pool2d(hf * hf, kernel_size=3, stride=1, padding=1)
-            sigma = torch.sqrt(torch.clamp(var, 1e-6))
-
-        xcat = torch.cat([img, xx, yy, sigma], dim=1)
+        # Accepts a [B,4,H,W] tensor with img, xx, yy, sigma
+        if x.dim() != 4 or x.shape[1] != 4:
+            raise ValueError("Input must be [B,4,H,W] with img, xx, yy, sigma")
 
         # Encoder
-        enc1_out = self.enc1(xcat)
+        enc1_out = self.enc1(x)
         enc2_out = self.enc2(self.pool1(enc1_out))
         enc3_out = self.enc3(self.pool2(enc2_out))
         enc4_out = self.enc4(self.pool3(enc3_out))
