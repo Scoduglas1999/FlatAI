@@ -323,14 +323,6 @@ def main():
             wl = min(1.0, global_step / max(1, WARMUP_LPIPS_STEPS))
             ws = min(1.0, global_step / max(1, WARMUP_STYLE_STEPS))
 
-            # Noise-aware fidelity: weight residuals by inverse variance (approx from affected)
-            with torch.no_grad():
-                mu = torch.nn.functional.avg_pool2d(y_obs, 3, 1, 1)
-                hf = y_obs - mu
-                var = torch.nn.functional.avg_pool2d(hf * hf, 3, 1, 1) + 1e-6
-                inv_var = 1.0 / var
-            loss_weighted_fid = (inv_var * (y_clean - y_true).abs()).mean()
-
             # Identity loss outside artifacts: penalize changes where affected≈sharp
             with torch.no_grad():
                 delta = torch.abs(affected - sharp)
@@ -352,9 +344,8 @@ def main():
                      (LAMBDA_LPIPS * wl) * loss_lpips +
                      (LAMBDA_PHYSICS * wp) * loss_physics +
                      (LAMBDA_STYLE * ws) * loss_style +
-                     0.5 * loss_weighted_fid +
-                     5.0 * loss_identity + # Increased from 2.0
-                     2.0 * loss_conf_clean + # Increased from 1.0
+                     0.5 * loss_identity +  # Reduced from 5.0
+                     0.2 * loss_conf_clean +  # Reduced from 2.0
                      0.05 * loss_F_mean +
                      0.1 * loss_smooth)
 
@@ -426,7 +417,6 @@ def main():
                     delta = torch.abs(affected - sharp)
                     ident_mask = (delta < 0.05).float()
                     ident_mask = torch.nn.functional.avg_pool2d(ident_mask, kernel_size=3, stride=1, padding=1)
-                loss_weighted_fid = (inv_var * (y_clean - y_true).abs()).mean()
                 loss_identity = (torch.abs(pred - affected) * ident_mask).mean()
                 loss_conf_clean = (M_pred * ident_mask).mean()
 
@@ -437,9 +427,8 @@ def main():
                              LAMBDA_LPIPS * loss_lpips +
                              LAMBDA_PHYSICS * loss_physics +
                              LAMBDA_STYLE * loss_style +
-                             0.5 * loss_weighted_fid +
-                             5.0 * loss_identity + # Increased from 2.0
-                             2.0 * loss_conf_clean + # Increased from 1.0
+                             0.5 * loss_identity + # Reduced from 5.0
+                             0.2 * loss_conf_clean + # Reduced from 2.0
                              0.05 * loss_F_mean +
                              0.1 * loss_smooth)
                 running_val += total_val.item()

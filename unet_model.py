@@ -4,6 +4,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def icnr_init(tensor, upscale_factor=2, a=0.0, b=1.0):
+    """
+    ICNR (Initialized - Checkerboard-artifact-free - N - Right) initialization.
+    Fills the tensor with values that mimic a nearest-neighbor interpolation,
+    which helps prevent checkerboard artifacts in upsampling layers.
+    """
+    o, i, h, w = tensor.shape
+    assert h == w and h % 2 == 1, "Kernel must be square with odd dimensions."
+    assert o % (upscale_factor ** 2) == 0, "Output channels must be divisible by upscale_factor squared."
+    
+    sub_kernel = torch.empty(o // (upscale_factor ** 2), i, h, w)
+    nn.init.uniform_(sub_kernel, a=a, b=b) # Or any other init
+    
+    kernel = sub_kernel.repeat_interleave(upscale_factor ** 2, dim=0)
+    
+    # Corrected logic for shuffling channels
+    c_out, c_in, k_h, k_w = kernel.shape
+    kernel = kernel.view(c_out // (upscale_factor**2), (upscale_factor**2), c_in, k_h, k_w)
+    kernel = kernel.permute(1, 0, 2, 3, 4).contiguous()
+    kernel = kernel.view(c_out, c_in, k_h, k_w)
+    
+    tensor.data.copy_(kernel)
+
+
 class ResidualBlock(nn.Module):
     """
     The fundamental building block of the Attention Res-UNet.
@@ -71,6 +96,34 @@ class AttentionGate(nn.Module):
         psi = self.psi(psi)
         return x * psi
 
+
+class PixelShuffleUpsample(nn.Module):
+    """
+    A modern upsampling block using PixelShuffle.
+    This avoids the checkerboard artifacts associated with ConvTranspose2d
+    or simple bilinear upsampling followed by convolution.
+    It consists of a convolution that increases channels by a factor of 4,
+    followed by PixelShuffle which rearranges those channels into a 2x
+    spatial upscaling.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Use a 3x3 conv for more spatial context before shuffling
+        self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+        self.norm = nn.BatchNorm2d(out_channels)
+        self.activ = nn.LeakyReLU(0.2, inplace=True)
+        # Initialize weights to prevent learned upsampling artifacts
+        icnr_init(self.conv.weight)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pixel_shuffle(x)
+        x = self.norm(x)
+        x = self.activ(x)
+        return x
+
+
 class AttentionResUNet(nn.Module):
     """
     A deep, wide Attention Residual U-Net.
@@ -97,26 +150,22 @@ class AttentionResUNet(nn.Module):
 
         # --- Decoder Path (with artifact-free up-sampling) ---
         # Up-sampling stage 4
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv4 = ResidualBlock(1024, 512) # Halve channels after upsampling
+        self.up4 = PixelShuffleUpsample(1024, 512)
         self.att4 = AttentionGate(F_g=512, F_l=512, F_int=256)
-        self.dec_combine4 = ResidualBlock(1024, 512) # Process concatenated features
+        self.dec_combine4 = ResidualBlock(1024, 512)
 
         # Up-sampling stage 3
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv3 = ResidualBlock(512, 256)
+        self.up3 = PixelShuffleUpsample(512, 256)
         self.att3 = AttentionGate(F_g=256, F_l=256, F_int=128)
         self.dec_combine3 = ResidualBlock(512, 256)
 
         # Up-sampling stage 2
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv2 = ResidualBlock(256, 128)
+        self.up2 = PixelShuffleUpsample(256, 128)
         self.att2 = AttentionGate(F_g=128, F_l=128, F_int=64)
         self.dec_combine2 = ResidualBlock(256, 128)
 
         # Up-sampling stage 1
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv1 = ResidualBlock(128, 64)
+        self.up1 = PixelShuffleUpsample(128, 64)
         self.att1 = AttentionGate(F_g=64, F_l=64, F_int=32)
         self.dec_combine1 = ResidualBlock(128, 64)
 
@@ -136,17 +185,21 @@ class AttentionResUNet(nn.Module):
         bottleneck_out = self.bottleneck(self.pool4(enc4_out))
 
         # --- Decoder ---
-        d4 = self.dec_conv4(self.up4(bottleneck_out))
-        d4 = self.dec_combine4(torch.cat([self.att4(d4, enc4_out), d4], dim=1))
+        d4 = self.up4(bottleneck_out)
+        attn4 = self.att4(g=d4, x=enc4_out)
+        d4 = self.dec_combine4(torch.cat([attn4, d4], dim=1))
+        
+        d3 = self.up3(d4)
+        attn3 = self.att3(g=d3, x=enc3_out)
+        d3 = self.dec_combine3(torch.cat([attn3, d3], dim=1))
+        
+        d2 = self.up2(d3)
+        attn2 = self.att2(g=d2, x=enc2_out)
+        d2 = self.dec_combine2(torch.cat([attn2, d2], dim=1))
 
-        d3 = self.dec_conv3(self.up3(d4))
-        d3 = self.dec_combine3(torch.cat([self.att3(d3, enc3_out), d3], dim=1))
-
-        d2 = self.dec_conv2(self.up2(d3))
-        d2 = self.dec_combine2(torch.cat([self.att2(d2, enc2_out), d2], dim=1))
-
-        d1 = self.dec_conv1(self.up1(d2))
-        d1 = self.dec_combine1(torch.cat([self.att1(d1, enc1_out), d1], dim=1))
+        d1 = self.up1(d2)
+        attn1 = self.att1(g=d1, x=enc1_out)
+        d1 = self.dec_combine1(torch.cat([attn1, d1], dim=1))
 
         # --- Output ---
         out = self.out_conv(d1)
@@ -177,23 +230,19 @@ class AttentionResUNetFG(nn.Module):
         self.bottleneck = ResidualBlock(512, 1024)
 
         # --- Decoder Path ---
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv4 = ResidualBlock(1024, 512)
+        self.up4 = PixelShuffleUpsample(1024, 512)
         self.att4 = AttentionGate(F_g=512, F_l=512, F_int=256)
         self.dec_combine4 = ResidualBlock(1024, 512)
 
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv3 = ResidualBlock(512, 256)
+        self.up3 = PixelShuffleUpsample(512, 256)
         self.att3 = AttentionGate(F_g=256, F_l=256, F_int=128)
         self.dec_combine3 = ResidualBlock(512, 256)
 
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv2 = ResidualBlock(256, 128)
+        self.up2 = PixelShuffleUpsample(256, 128)
         self.att2 = AttentionGate(F_g=128, F_l=128, F_int=64)
         self.dec_combine2 = ResidualBlock(256, 128)
 
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.dec_conv1 = ResidualBlock(128, 64)
+        self.up1 = PixelShuffleUpsample(128, 64)
         self.att1 = AttentionGate(F_g=64, F_l=64, F_int=32)
         self.dec_combine1 = ResidualBlock(128, 64)
 
@@ -220,17 +269,21 @@ class AttentionResUNetFG(nn.Module):
         bottleneck_out = self.bottleneck(self.pool4(enc4_out))
 
         # Decoder
-        d4 = self.dec_conv4(self.up4(bottleneck_out))
-        d4 = self.dec_combine4(torch.cat([self.att4(d4, enc4_out), d4], dim=1))
+        d4 = self.up4(bottleneck_out)
+        attn4 = self.att4(g=d4, x=enc4_out)
+        d4 = self.dec_combine4(torch.cat([attn4, d4], dim=1))
 
-        d3 = self.dec_conv3(self.up3(d4))
-        d3 = self.dec_combine3(torch.cat([self.att3(d3, enc3_out), d3], dim=1))
+        d3 = self.up3(d4)
+        attn3 = self.att3(g=d3, x=enc3_out)
+        d3 = self.dec_combine3(torch.cat([attn3, d3], dim=1))
 
-        d2 = self.dec_conv2(self.up2(d3))
-        d2 = self.dec_combine2(torch.cat([self.att2(d2, enc2_out), d2], dim=1))
-
-        d1 = self.dec_conv1(self.up1(d2))
-        d1 = self.dec_combine1(torch.cat([self.att1(d1, enc1_out), d1], dim=1))
+        d2 = self.up2(d3)
+        attn2 = self.att2(g=d2, x=enc2_out)
+        d2 = self.dec_combine2(torch.cat([attn2, d2], dim=1))
+        
+        d1 = self.up1(d2)
+        attn1 = self.att1(g=d1, x=enc1_out)
+        d1 = self.dec_combine1(torch.cat([attn1, d1], dim=1))
 
         out = self.out_conv_fg(d1)
         logF_raw = self.tanh(out[:, 0:1, :, :]) * self.max_log_F  # [-max_log_F, +max_log_F]
