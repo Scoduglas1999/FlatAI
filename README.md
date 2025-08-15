@@ -2,7 +2,7 @@
 
 **FlatAI** is a deep learning framework for correcting optical artifacts in astronomical images. It uses a physics-informed neural network to remove vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, eliminating the need for traditional flat-field calibration frames.
 
-This project has evolved to incorporate a sophisticated **hybrid data pipeline** and advanced training techniques to produce a state-of-the-art correction model that is robust, efficient, and less prone to common deep learning artifacts.
+This project uses a large-scale, pre-generated synthetic dataset and advanced training techniques to produce a state-of-the-art correction model that is robust, efficient, and less prone to common deep learning artifacts.
 
 ![Sample Correction](flat_demo_samples/demo_combined.png)
 
@@ -96,15 +96,11 @@ graph TD
 ```
 </details>
 
-## Hybrid Dataset Strategy
+## Synthetic Dataset Generation
 
-To ensure robust training and reliable validation, this project employs a hybrid dataset strategy:
+To ensure robust and reproducible training, this project relies on a large-scale, pre-generated dataset. The `create_flat_dataset.py` script is responsible for creating a complete set of static training and validation samples.
 
-1.  **Dynamic "On-the-Fly" Training Set:**
-    The training data is generated in real-time. The `FlatFieldDataset` class loads a pre-processed sharp image and applies a unique, randomly generated set of artifacts to it for each training step. This creates a virtually infinite dataset, preventing overfitting and exposing the model to a vast range of conditions.
-
-2.  **Static Validation Set:**
-    The validation set is pre-generated and fixed. This ensures that the model's performance is evaluated against the same consistent data from epoch to epoch, providing a stable and reliable metric for tracking progress.
+This script takes a directory of high-quality sharp images and applies a wide variety of procedurally generated artifacts to create a diverse dataset. The generated data is then compressed to save disk space while maintaining fast load times.
 
 The `artifact_generator.py` script is central to this process, procedurally generating realistic artifacts:
 -   **Multiplicative ($F_{mult}$):** Vignetting, complex dust motes (soft, hard, and donut-shaped), and PRNU noise.
@@ -116,7 +112,7 @@ Several advanced techniques are used to ensure stable, efficient, and effective 
 
 -   **Variable-Size Image Training:** The model is not trained on fixed-size crops. Instead, a custom `collate_fn` dynamically pads images within each batch to match the largest image's dimensions. This forces the model to become size-agnostic and is critical for **preventing tiling artifacts** in the final corrected images.
 
--   **Aggressive Data Augmentation:** To further improve robustness, training samples are subjected to random horizontal flips, vertical flips, and 90-degree rotations. This ensures the model learns the underlying structure of artifacts, not their specific orientation or position.
+-   **Aggressive Data Augmentation:** To further improve robustness, the *on-the-fly* data loader in `flat_dataset.py` applies random horizontal flips, vertical flips, and 90-degree rotations to the static data as it's loaded. This ensures the model learns the underlying structure of artifacts, not their specific orientation or position.
 
 -   **Gradient Accumulation:** To train with a large effective batch size on limited VRAM, gradients are accumulated over several smaller batches before an optimizer step is performed. This stabilizes the learning process without requiring a high-end GPU.
 
@@ -135,7 +131,7 @@ pip install torch torchvision numpy astropy matplotlib tqdm lpips
 
 ### 2. Dataset Generation
 1.  Place your high-quality, artifact-free astronomical images (FITS, PNG, or JPG) in the `sharp_images/` directory.
-2.  Run the dataset generation script. This will pre-process the sharp images for the on-the-fly trainer and create the static validation set.
+2.  Run the dataset generation script. This will create the complete, compressed training and validation sets.
     ```bash
     python create_flat_dataset.py
     ```

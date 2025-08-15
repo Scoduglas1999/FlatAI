@@ -195,8 +195,7 @@ def main():
     # Data
     train_dataset = FlatFieldDataset(
         root_dir=DATA_DIR,
-        mode='train',
-        max_train_side=512,  # Limit dynamic sample size for speed
+        mode='train_fixed',  # Use the pre-generated static training set
     )
     val_dataset = FlatFieldDataset(
         root_dir=DATA_DIR,
