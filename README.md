@@ -1,10 +1,10 @@
-# FlatAI - Synthetic Flat Frames Done In Seconds Using Neural Networks
+# FlatAI - AI-Powered Flat-Field Correction
 
-**FlatAI** is a deep learning-based framework for advanced correction of optical artifacts in astrophotography images. This repository details a state-of-the-art approach that goes beyond simple image-to-image translation, instead modeling the physical processes of image degradation to achieve superior correction quality. The system is designed to remove a wide range of common artifacts, including vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, effectively eliminating the need for traditional flat-field calibration frames.
+**FlatAI** is a deep learning framework for correcting optical artifacts in astronomical images. It uses a physics-informed neural network to remove vignetting, dust motes, sensor non-uniformity (PRNU), and additive gradients from sources like amplifier glow, eliminating the need for traditional flat-field calibration frames.
 
-## Abstract
+This project has evolved to incorporate a sophisticated **hybrid data pipeline** and advanced training techniques to produce a state-of-the-art correction model that is robust, efficient, and less prone to common deep learning artifacts.
 
-Traditional flat-field correction in astrophotography relies on capturing dedicated calibration frames, a process that is often tedious and prone to error. This project introduces a novel deep learning paradigm that circumvents this requirement. We propose a specially designed U-Net architecture, `AttentionResUNetFG`, which, instead of mapping a corrupted image directly to a clean one, learns to deconstruct the image into its constituent physical components. The model explicitly predicts the multiplicative flat-field ($F_{mul}$) and the additive gradient field ($G_{add}$) that corrupt the true astronomical signal ($I_{true}$). This is achieved by training the network with a sophisticated, multi-component loss function that includes perceptual, style, and physics-informed terms, ensuring both high-fidelity reconstruction and physical consistency. The result is a robust system capable of producing high-quality, artifact-free images from a single input frame.
+![Sample Correction](flat_demo_samples/demo_combined.png)
 
 ## The Physical Model of Image Degradation
 
@@ -15,22 +15,22 @@ $I_{observed} = (I_{true} \times F_{mult}) + G_{add}$
 Where:
 -   $I_{observed}$ is the final image captured by the sensor.
 -   $I_{true}$ is the "perfect" image of the astronomical object.
--   $F_{mult}$ is the **multiplicative flat-field**, a 2D map representing artifacts like vignetting, dust motes, and photo-response non-uniformity (PRNU). Values in this field are typically centered around 1.0.
--   $G_{add}$ is the **additive gradient field**, a 2D map representing artifacts like amplifier glow and linear gradients, which are independent of the image signal.
+-   $F_{mult}$ is the **multiplicative flat-field**, a 2D map representing artifacts like vignetting and dust motes.
+-   $G_{add}$ is the **additive gradient field**, a 2D map representing artifacts like amplifier glow.
 
 The network is designed to predict $F_{mult}$ and $G_{add}$ directly, allowing for a physically-motivated correction.
 
 ## Model Architecture: `AttentionResUNetFG`
 
-The core of this project is the `AttentionResUNetFG`, a variant of the popular U-Net architecture enhanced with several key features:
+The core of this project is the `AttentionResUNetFG`, a U-Net architecture enhanced with several key features:
 
-1.  **Residual Blocks:** The standard convolutional blocks are replaced with residual blocks (`ResidualBlock`) to facilitate the training of a deeper network and mitigate the vanishing gradient problem.
-2.  **Attention Gates:** Attention gates are integrated into the decoder's skip connections. This allows the model to selectively focus on the most relevant features from the encoder path, improving reconstruction accuracy.
+1.  **Residual Blocks:** Facilitate the training of a deeper network and mitigate vanishing gradients.
+2.  **Attention Gates:** Allow the model to selectively focus on the most relevant features from the encoder path, improving reconstruction accuracy.
 3.  **Multi-Headed Output:** The network has three output heads, predicting:
     -   $F_{mul}$: The multiplicative field.
     -   $G_{add}$: The additive field.
-    -   $M$: A **confidence map**, which the model uses to modulate the strength of the correction. This prevents the model from altering parts of the image that are already clean.
-4.  **Spatially-Aware Input:** The model receives four input channels: the affected image, two normalized coordinate channels (`xx`, `yy`), and a dynamically generated local noise map. This provides the network with global spatial context and helps it differentiate between signal, noise, and artifacts.
+    -   $M$: A **confidence map**, which prevents the model from altering parts of the image that are already clean.
+4.  **Spatially-Aware Input:** The model receives four input channels: the affected image, two normalized coordinate channels (`xx`, `yy`), and a dynamically generated local noise map. This provides global spatial context and helps differentiate between signal, noise, and artifacts.
 
 <details>
 <summary>Click to expand a diagram of the model architecture</summary>
@@ -96,37 +96,36 @@ graph TD
 ```
 </details>
 
-## Synthetic Data Generation
+## Hybrid Dataset Strategy
 
-A robust model requires a diverse and realistic dataset. The `create_flat_dataset.py` script generates a large-scale synthetic dataset by applying procedurally generated artifacts to a collection of clean, high-quality astronomical images.
+To ensure robust training and reliable validation, this project employs a hybrid dataset strategy:
 
-The generation process includes:
--   **Multiplicative Artifacts ($F_{mult}$):**
-    -   **Vignetting:** Parametrized radial gradients.
-    -   **Dust Motes:** A sophisticated generator for creating realistic dust motes, including soft, hard, and donut-shaped occlusions with irregular edges.
-    -   **PRNU:** Low-frequency, noise-like patterns simulating sensor non-uniformity.
--   **Additive Artifacts ($G_{add}$):**
-    -   **Linear Gradients:** Simulating uneven skyglow or light pollution.
-    -   **Amplifier Glow:** Exponential glow originating from the corners of the image.
+1.  **Dynamic "On-the-Fly" Training Set:**
+    The training data is generated in real-time. The `FlatFieldDataset` class loads a pre-processed sharp image and applies a unique, randomly generated set of artifacts to it for each training step. This creates a virtually infinite dataset, preventing overfitting and exposing the model to a vast range of conditions.
 
-The script also employs a **curriculum learning** strategy, gradually increasing the intensity and complexity of the artifacts as more data is generated. This helps the model learn basic corrections before tackling more challenging examples.
+2.  **Static Validation Set:**
+    The validation set is pre-generated and fixed. This ensures that the model's performance is evaluated against the same consistent data from epoch to epoch, providing a stable and reliable metric for tracking progress.
 
-## Training and Loss Function
+The `artifact_generator.py` script is central to this process, procedurally generating realistic artifacts:
+-   **Multiplicative ($F_{mult}$):** Vignetting, complex dust motes (soft, hard, and donut-shaped), and PRNU noise.
+-   **Additive ($G_{add}$):** Linear gradients and amplifier glow.
 
-The model is trained to minimize a composite loss function, carefully designed to balance reconstruction accuracy with perceptual quality and physical realism.
+## Advanced Training Methodology
 
-$L_{total} = \lambda_{L1} L_{L1} + \lambda_{LPIPS} L_{LPIPS} + \lambda_{Style} L_{Style} + \lambda_{Physics} L_{Physics} + L_{Priors}$
+Several advanced techniques are used to ensure stable, efficient, and effective training:
 
--   **$L_{L1}$:** Standard L1 pixel-wise loss between the corrected and ground-truth images.
--   **$L_{LPIPS}$:** The Learned Perceptual Image Patch Similarity (LPIPS) loss, which better aligns with human perception of image quality.
--   **$L_{Style}$:** A VGG-based style loss that preserves the texture of the original image by comparing the Gram matrices of feature maps.
--   **$L_{Physics}$:** A **physics-informed consistency loss**. After the model predicts a clean image $I_{pred}$, this image is fed *back* into the forward physics model using the predicted fields $F_{pred}$ and $G_{pred}$. The result is compared to the original input image $I_{observed}$. This forces the model to learn the true degradation process, not just an arbitrary image-to-image mapping.
--   **$L_{Priors}$:** A set of regularization terms that impose physically-motivated constraints, such as smoothness on the predicted fields and penalties for altering already-clean regions of the image.
+-   **Variable-Size Image Training:** The model is not trained on fixed-size crops. Instead, a custom `collate_fn` dynamically pads images within each batch to match the largest image's dimensions. This forces the model to become size-agnostic and is critical for **preventing tiling artifacts** in the final corrected images.
+
+-   **Aggressive Data Augmentation:** To further improve robustness, training samples are subjected to random horizontal flips, vertical flips, and 90-degree rotations. This ensures the model learns the underlying structure of artifacts, not their specific orientation or position.
+
+-   **Gradient Accumulation:** To train with a large effective batch size on limited VRAM, gradients are accumulated over several smaller batches before an optimizer step is performed. This stabilizes the learning process without requiring a high-end GPU.
+
+-   **Physics-Informed Loss:** The composite loss function combines standard pixel-wise and perceptual (LPIPS) losses with a **physics consistency loss**. This term ensures the predicted correction fields are physically plausible by feeding the corrected image back through the degradation model and comparing it to the original input.
 
 ## Usage
 
 ### 1. Setup
-Clone the repository and install the necessary packages. A `requirements.txt` is not yet provided, but key dependencies include `torch`, `torchvision`, `numpy`, `astropy`, `matplotlib`, `tqdm`, and `lpips`.
+Clone the repository and install the required packages.
 
 ```bash
 git clone https://github.com/your-username/FlatAI.git
@@ -135,29 +134,27 @@ pip install torch torchvision numpy astropy matplotlib tqdm lpips
 ```
 
 ### 2. Dataset Generation
-1.  Populate the `sharp_images/` directory with high-quality, artifact-free astronomical images (FITS, PNG, or JPG).
-2.  Run the dataset generation script:
+1.  Place your high-quality, artifact-free astronomical images (FITS, PNG, or JPG) in the `sharp_images/` directory.
+2.  Run the dataset generation script. This will pre-process the sharp images for the on-the-fly trainer and create the static validation set.
     ```bash
     python create_flat_dataset.py
     ```
-    This will create the `randomized_flat_dataset/` directory containing training and validation data.
+    This will create the `randomized_flat_dataset/` directory.
 
 ### 3. Training
-To train the model, run the main training script. Training will automatically resume from a checkpoint if one is found.
+Start the training process. The script supports automatic resuming from checkpoints.
+
 ```bash
 python train_unet_flat.py
 ```
-Training progress, including sample images and a loss curve, will be saved to the `flat_training_samples/` directory.
+Training samples and a loss curve will be saved to the `flat_training_samples/` directory.
 
 ### 4. Inference
-A graphical user interface is provided for applying the trained model to new images.
+Use the provided GUI to apply the trained model to new images.
+
 ```bash
 python gui_corrector_final.py
 ```
-
-## Future Work
--   **Hyperparameter Optimization:** A systematic search for the optimal weights ($\lambda$) of the loss components could further improve results.
--   **Combined Aberration and Flat Correction:** The architecture could be extended to simultaneously correct for optical aberrations (like coma and astigmatism) in addition to flat-field artifacts.
 
 ## License
 This project is licensed under the MIT License. See the `LICENSE` file for details.
