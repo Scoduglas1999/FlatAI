@@ -120,7 +120,8 @@ LOSS_CURVE_PATH = "./flat_loss_curve.png"
 RESUME_TRAINING = False
 FINE_TUNING_MODE = False
 LEARNING_RATE = 1e-5
-BATCH_SIZE = 8
+BATCH_SIZE = 2  # Keep low for VRAM; effective batch size is BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+GRADIENT_ACCUMULATION_STEPS = 4  # Accumulate grads over N steps
 NUM_EPOCHS = 150
 USE_AMP = True  # mixed precision for speed/stability on CUDA
 
@@ -193,16 +194,13 @@ def main():
 
     # Data
     train_dataset = FlatFieldDataset(
-        sharp_dir=os.path.join(DATA_DIR, 'train', 'sharp'),
-        affected_dir=os.path.join(DATA_DIR, 'train', 'affected'),
-        flat_dir=os.path.join(DATA_DIR, 'train', 'flat'),
-        grad_dir=os.path.join(DATA_DIR, 'train', 'grad'),
+        root_dir=DATA_DIR,
+        mode='train',
+        max_train_side=512,  # Limit dynamic sample size for speed
     )
     val_dataset = FlatFieldDataset(
-        sharp_dir=os.path.join(DATA_DIR, 'val', 'sharp'),
-        affected_dir=os.path.join(DATA_DIR, 'val', 'affected'),
-        flat_dir=os.path.join(DATA_DIR, 'val', 'flat'),
-        grad_dir=os.path.join(DATA_DIR, 'val', 'grad'),
+        root_dir=DATA_DIR,
+        mode='val',
     )
     num_workers = 4
     train_loader = DataLoader(
@@ -212,6 +210,7 @@ def main():
         num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         persistent_workers=(num_workers > 0),
+        collate_fn=variable_size_collate_fn  # Use custom collate
     )
     val_loader = DataLoader(
         val_dataset,
@@ -220,6 +219,7 @@ def main():
         num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         persistent_workers=(num_workers > 0),
+        collate_fn=variable_size_collate_fn  # Use custom collate
     )
 
     # Model & losses
@@ -273,13 +273,14 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train] LR: {current_lr:.2e}")
         max_train_steps = int(os.environ.get('MAX_TRAIN_STEPS', '0'))
         step_count = 0
-        for affected, sharp, flat, grad in pbar:
+        optimizer.zero_grad() # Zero out gradients at the start of the epoch
+        for i, (affected, sharp, flat, grad) in enumerate(pbar):
             affected = affected.to(device)
             sharp = sharp.to(device)
             flat = flat.to(device)
             grad = grad.to(device)
 
-            optimizer.zero_grad(set_to_none=True)
+            # No need to zero grad here anymore, moved to outer loop
             with torch.amp.autocast(device_type, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
                 # Build absolute coordinate channels for global context
                 b, _, h, w = affected.shape
@@ -349,24 +350,41 @@ def main():
                      0.05 * loss_F_mean +
                      0.1 * loss_smooth)
 
+            # Scale the loss by accumulation steps
+            total = total / GRADIENT_ACCUMULATION_STEPS
+
             # NaN/Inf guard
             if not torch.isfinite(total):
+                # We can't recover from this, so skip the entire accumulation batch.
+                # A smarter implementation might just skip this micro-batch.
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
             scaler.scale(total).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
 
-            running += total.item()
+            # --- Gradient Accumulation ---
+            if (i + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True) # Zero grads after optimizer step
+
+            running += total.item() * GRADIENT_ACCUMULATION_STEPS # Un-scale for logging
             pbar.set_postfix_str(
-                f"loss={total.item():.6f} (L1 {loss_l1.item():.4f} | LPIPS {loss_lpips.item():.4f} | PHY {loss_physics.item():.4f} | ST {loss_style.item():.4f})"
+                f"loss={total.item() * GRADIENT_ACCUMULATION_STEPS:.6f} (L1 {loss_l1.item():.4f} | LPIPS {loss_lpips.item():.4f} | PHY {loss_physics.item():.4f} | ST {loss_style.item():.4f})"
             )
             step_count += 1
             global_step += 1
             if max_train_steps and step_count >= max_train_steps:
                 break
+        
+        # At the end of epoch, step optimizer if there are any remaining gradients
+        if (len(train_loader) % GRADIENT_ACCUMULATION_STEPS) != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
 
         avg_train = running / len(train_loader)
         train_losses.append(avg_train)
@@ -468,6 +486,41 @@ def main():
     plt.savefig(LOSS_CURVE_PATH)
     plt.close()
     print(f"Loss curve saved to {LOSS_CURVE_PATH}")
+
+
+def variable_size_collate_fn(batch):
+    """
+    Custom collate function to handle images of different sizes.
+    It pads all images in a batch to the size of the largest image in that batch.
+    - Images (affected, sharp) are normalized to [-1, 1], so pad with 0 (mid-grey).
+    - Multiplicative field (flat) is ~1.0, so pad with 1.0.
+    - Additive field (grad) is ~0.0, so pad with 0.0.
+    """
+    # Unzip the batch: from list of tuples to tuple of lists
+    affected_tensors, sharp_tensors, flat_tensors, grad_tensors = zip(*batch)
+
+    # Find the maximum height and width in the batch for the primary tensors.
+    max_h = max(t.shape[1] for t in sharp_tensors)
+    max_w = max(t.shape[2] for t in sharp_tensors)
+
+    def pad_to_max(tensors, value):
+        padded = []
+        for t in tensors:
+            h, w = t.shape[1], t.shape[2]
+            pad_h = max_h - h
+            pad_w = max_w - w
+            # Pad on bottom and right
+            # torch.nn.functional.pad format is (pad_left, pad_right, pad_top, pad_bottom)
+            padding = (0, pad_w, 0, pad_h)
+            padded.append(torch.nn.functional.pad(t, padding, "constant", value))
+        return torch.stack(padded, dim=0)
+
+    affected_batch = pad_to_max(affected_tensors, 0.0)
+    sharp_batch = pad_to_max(sharp_tensors, 0.0)
+    flat_batch = pad_to_max(flat_tensors, 1.0) # Pad multiplicative field with 1
+    grad_batch = pad_to_max(grad_tensors, 0.0) # Pad additive field with 0
+
+    return affected_batch, sharp_batch, flat_batch, grad_batch
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import torch.nn as nn
 from astropy.io import fits
 import time
 import torch.nn.functional as F
+from typing import Tuple
 
 # Force astropy to use a more forgiving encoding for FITS headers
 # to prevent crashes on non-standard metadata.
@@ -24,6 +25,24 @@ except ImportError:
     Image = None
 
 from unet_model import AttentionResUNet, AttentionResUNetFG
+
+# =============================================================================
+# --- UTILITY FUNCTIONS ---
+# =============================================================================
+def pad_to_sixteen(image_tensor: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Pads a [B,C,H,W] tensor so H and W are divisible by 16."""
+    h, w = image_tensor.shape[2:]
+    orig_dims = (h, w)
+
+    pad_h = (16 - h % 16) % 16
+    pad_w = (16 - w % 16) % 16
+
+    if pad_h == 0 and pad_w == 0:
+        return image_tensor, orig_dims
+
+    # F.pad format is (pad_left, pad_right, pad_top, pad_bottom)
+    padded_tensor = F.pad(image_tensor, (0, pad_w, 0, pad_h), mode='reflect')
+    return padded_tensor, orig_dims
 
 # =============================================================================
 # --- BACKEND PROCESSING LOGIC (Restored from original) ---
@@ -165,88 +184,26 @@ def detect_image_type_improved(image_data):
     return is_linear_votes >= 1
 
 def _process_single_channel(image_2d, model, device, progress_callback, status_callback, force_linear):
+    """
+    Processes a single-channel 2D numpy array using memory-safe tiled inference.
+    """
     is_linear = force_linear if force_linear is not None else detect_image_type_improved(image_2d)
-    
+
+    # --- Normalization (global) ---
     if is_linear:
         status_callback("Using LINEAR mode - global normalization.")
-        # Use true minimum to preserve faint background and high percentile for highlights
         global_min, global_max = float(np.min(image_2d)), float(np.percentile(image_2d, 99.99))
         if not np.isfinite(global_max) or global_max <= global_min:
             global_min, global_max = float(np.min(image_2d)), float(np.max(image_2d))
     else:
-        status_callback("Using NON-LINEAR mode - per-tile normalization.")
-        global_min, global_max = None, None
+        status_callback("Using NON-LINEAR mode - percentile normalization.")
+        global_min, global_max = np.percentile(image_2d, 1), np.percentile(image_2d, 99)
 
-    corrected_image = np.zeros_like(image_2d, dtype=np.float32)
-    weight_map = np.zeros_like(image_2d, dtype=np.float32)
-    
-    TILE_SIZE = 256
-    TILE_OVERLAP = 48
-    step = TILE_SIZE - TILE_OVERLAP
+    # --- Tiled Inference ---
+    status_callback("Running AI correction (tiled)...")
+    corrected_image = _process_by_tiling(image_2d, model, device, progress_callback, status_callback, force_linear, global_min, global_max)
 
-    window = np.hanning(TILE_SIZE)
-    window = np.outer(window, window)
-
-    y_coords = list(range(0, image_2d.shape[0], step))
-    x_coords = list(range(0, image_2d.shape[1], step))
-    if (image_2d.shape[0] % step) != 0: y_coords.append(image_2d.shape[0] - TILE_SIZE)
-    if (image_2d.shape[1] % step) != 0: x_coords.append(image_2d.shape[1] - TILE_SIZE)
-    y_coords = sorted(list(set([max(0, y) for y in y_coords])))
-    x_coords = sorted(list(set([max(0, x) for x in x_coords])))
-
-    total_tiles = len(x_coords) * len(y_coords)
-    tile_count = 0
-    
-    for y in y_coords:
-        for x in x_coords:
-            tile_count += 1
-            progress_callback((tile_count / total_tiles) * 100)
-            
-            h, w = image_2d.shape
-            tile = image_2d[y:min(y + TILE_SIZE, h), x:min(x + TILE_SIZE, w)]
-            
-            tile_h, tile_w = tile.shape
-            padded_tile = np.zeros((TILE_SIZE, TILE_SIZE), dtype=tile.dtype)
-            padded_tile[:tile_h, :tile_w] = tile
-
-            if padded_tile.std() < 1e-8:
-                corrected_padded_tile = padded_tile.copy()
-            else:
-                input_tensor, norm_range = preprocess_tile_fg(padded_tile, device, global_min, global_max)
-                with torch.no_grad():
-                    out = model(input_tensor)
-                    if isinstance(out, tuple) and len(out) >= 2:
-                        F_pred, G_pred, M_pred = out if len(out) == 3 else (*out, None)
-                        
-                        pmin, pmax = norm_range
-                        tile01 = np.clip((padded_tile - pmin) / (pmax - pmin + 1e-6), 0.0, 1.0)
-                        tile01_t = torch.from_numpy(tile01).unsqueeze(0).unsqueeze(0).to(device)
-
-                        y_clean_ungated = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
-                        
-                        if M_pred is not None:
-                            y_clean_res = torch.clamp(tile01_t + M_pred * (y_clean_ungated - tile01_t), 0.0, 1.0)
-                        else:
-                            y_clean_res = y_clean_ungated
-                        
-                        corrected_padded_tile = y_clean_res.squeeze().cpu().numpy().astype(np.float32)
-                        
-                        # Denormalize
-                        corrected_padded_tile = corrected_padded_tile * (pmax - pmin) + pmin
-                    else:
-                        # Fallback for old model type, though FG is standard now
-                        corrected_tensor = out
-                        corrected_tensor = torch.clamp(corrected_tensor, -1.0, 1.0)
-                        corrected_padded_tile = postprocess_tile(corrected_tensor, norm_range)
-            
-            corrected_tile = corrected_padded_tile[:tile_h, :tile_w]
-            current_window = window[:tile_h, :tile_w]
-
-            corrected_image[y:y+tile_h, x:x+tile_w] += corrected_tile * current_window
-            weight_map[y:y+tile_h, x:x+tile_w] += current_window
-
-    weight_map[weight_map == 0] = 1.0
-    corrected_image /= weight_map
+    status_callback("Post-processing...")
 
     # Optional conservative blending to preserve structures and only correct artifacts
     def _gaussian_kernel1d(sigma: float, radius: int | None = None) -> np.ndarray:
@@ -332,9 +289,95 @@ def _process_single_channel(image_2d, model, device, progress_callback, status_c
 
     return corrected_image
 
+
+def _process_by_tiling(image_2d, model, device, progress_callback, status_callback, force_linear, global_min, global_max):
+    """Processes the image by breaking it into overlapping tiles (memory-safe)."""
+    H, W = image_2d.shape
+    corrected_image = np.zeros((H, W), dtype=np.float32)
+    weight_map = np.zeros((H, W), dtype=np.float32)
+
+    TILE_SIZE = 640  # balanced for 16GB VRAM; adjust if needed
+    TILE_OVERLAP = 80
+    step = TILE_SIZE - TILE_OVERLAP
+
+    window_1d = np.hanning(TILE_SIZE).astype(np.float32)
+    window_2d = np.outer(window_1d, window_1d)
+
+    y_coords = list(range(0, H, step))
+    x_coords = list(range(0, W, step))
+    if (H - y_coords[-1]) < TILE_SIZE:
+        y_coords[-1] = max(0, H - TILE_SIZE)
+    if (W - x_coords[-1]) < TILE_SIZE:
+        x_coords[-1] = max(0, W - TILE_SIZE)
+
+    y_coords = sorted(set(y_coords))
+    x_coords = sorted(set(x_coords))
+
+    total_tiles = len(x_coords) * len(y_coords)
+    tile_count = 0
+
+    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    autocast_ctx = torch.amp.autocast(device_type, dtype=torch.float16, enabled=(device.type == 'cuda'))
+
+    for y in y_coords:
+        for x in x_coords:
+            tile_count += 1
+            progress_callback(min(95.0, (tile_count / max(1, total_tiles)) * 95.0))
+
+            y_end = min(y + TILE_SIZE, H)
+            x_end = min(x + TILE_SIZE, W)
+            tile = image_2d[y:y_end, x:x_end]
+            th, tw = tile.shape
+
+            # Reflect-pad tile to multiple of 16
+            pad_h = (16 - th % 16) % 16
+            pad_w = (16 - tw % 16) % 16
+            if pad_h or pad_w:
+                padded_tile = np.pad(tile, ((0, pad_h), (0, pad_w)), mode='reflect')
+            else:
+                padded_tile = tile
+
+            if padded_tile.std() < 1e-8:
+                corrected_padded = padded_tile.astype(np.float32)
+            else:
+                input_tensor, norm_range = preprocess_tile_fg(padded_tile, device, global_min, global_max)
+                # Channels-last for better memory locality
+                input_tensor = input_tensor.contiguous(memory_format=torch.channels_last)
+                with torch.no_grad():
+                    with autocast_ctx:
+                        out = model(input_tensor)
+                        if isinstance(out, tuple) and len(out) >= 2:
+                            F_pred, G_pred, M_pred = out if len(out) == 3 else (*out, None)
+                            pmin, pmax = norm_range
+                            tile01 = np.clip((padded_tile - pmin) / (pmax - pmin + 1e-6), 0.0, 1.0).astype(np.float32)
+                            tile01_t = torch.from_numpy(tile01).unsqueeze(0).unsqueeze(0).to(device)
+                            # Match memory format
+                            tile01_t = tile01_t.contiguous(memory_format=torch.channels_last)
+                            y_clean_ungated = torch.clamp((tile01_t - G_pred) / torch.clamp(F_pred, 1e-3, None), 0.0, 1.0)
+                            if M_pred is not None:
+                                y_clean_res = torch.clamp(tile01_t + M_pred * (y_clean_ungated - tile01_t), 0.0, 1.0)
+                            else:
+                                y_clean_res = y_clean_ungated
+                            corrected_padded = (y_clean_res.squeeze().float().cpu().numpy())
+                            corrected_padded = corrected_padded * (pmax - pmin) + pmin
+                        else:
+                            corrected_tensor = torch.clamp(out, -1.0, 1.0).float().cpu()
+                            corrected_padded = postprocess_tile(corrected_tensor, norm_range)
+
+            corrected_tile = corrected_padded[:th, :tw]
+            w2d = window_2d[:th, :tw]
+            corrected_image[y:y+th, x:x+tw] += corrected_tile * w2d
+            weight_map[y:y+th, x:x+tw] += w2d
+
+    weight_map[weight_map == 0] = 1.0
+    corrected_image /= weight_map
+    return corrected_image.astype(np.float32)
+
+
 def run_correction_logic(image_path, model_path, output_path, progress_callback, status_callback, app_instance, force_mode_str, overwrite):
     try:
         status_callback("Setting up...")
+        progress_callback(5)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         if force_mode_str == "auto": force_mode = None
@@ -376,18 +419,22 @@ def run_correction_logic(image_path, model_path, output_path, progress_callback,
         original_dtype = source_dtype if source_dtype is not None else raw_image.dtype
         start_time = time.time()
         
+        progress_callback(15)
         if raw_image.ndim == 2:
             final_image = _process_single_channel(raw_image, model, device, progress_callback, status_callback, force_mode)
+            progress_callback(80)
         elif raw_image.ndim == 3 and raw_image.shape[0] == 3:
             corrected_channels = []
             for i in range(3):
-                channel_progress = lambda p, chan=i: progress_callback((chan * 100 + p) / 3)
+                channel_progress = lambda p, chan=i: progress_callback(15 + (chan * 65 + p * 0.65) / 3)
                 channel_status = lambda msg, chan=i: status_callback(f"[Channel {chan+1}/3] {msg}")
                 corrected_channels.append(_process_single_channel(raw_image[i], model, device, channel_progress, channel_status, force_mode))
             final_image = np.stack(corrected_channels, axis=0)
+            progress_callback(80)
         else:
             raise ValueError(f"Unsupported image shape: {raw_image.shape}")
 
+        status_callback("Saving corrected image...")
         if app_instance.save_float32_var.get():
             final_image = final_image.astype(np.float32)
         else:

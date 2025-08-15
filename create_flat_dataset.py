@@ -1,28 +1,17 @@
 """
-create_flat_dataset.py - Synthetic Flat-Field Artifact Dataset Generator
+create_flat_dataset.py - Hybrid Dataset Generator
 
-This script generates a dataset for training a neural network to correct flat-field
-artifacts in astrophotography images. It synthesizes:
- - Multiplicative field F(x,y): vignetting, PRNU, dust motes (dark/light, in/out of focus)
- - Additive field G(x,y): illumination gradients, amp glow
+This script now serves two purposes for a more robust and scalable training pipeline:
 
-Observed image model:
-    I_obs = clip(I_true * F + G, 0, 1)
+1.  **On-the-Fly Training Set:** It processes all images from the `SHARP_IMAGE_DIR`,
+    resizing and padding them correctly. It saves these "base" sharp images
+    to a `train/sharp_processed` directory. The live `FlatFieldDataset` will
+    use these to generate unique training samples in real-time.
 
-Output directory structure:
-  randomized_flat_dataset/
-    train/
-      sharp/      (ground-truth, [0,1])
-      affected/   (flat-affected input, [0,1])
-      flat/       (multiplicative field F, mean-normalized around 1)
-      grad/       (additive field G, [0, ~0.3])
-    val/
-      ... same as train
-
-Notes:
- - Uses only NumPy and PyTorch to avoid extra dependencies. Heavy lifting is done
-   via torch for convenience and speed (CUDA if available).
- - The generator employs curriculum learning to gradually increase artifact severity.
+2.  **Fixed Validation Set:** It generates a static, pre-calculated set of
+    validation samples (`sharp`, `affected`, `flat`, `grad`). This ensures
+    that the validation metric is stable and reliable from epoch to epoch,
+    as the model is always tested against the exact same data.
 """
 
 import os
@@ -35,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from astropy.io import fits
 from tqdm import tqdm
+
+from artifact_generator import synthesize_fields, apply_poisson_read_noise
 
 try:
     from PIL import Image
@@ -49,18 +40,23 @@ except ImportError:
 SHARP_IMAGE_DIR = "./sharp_images/"
 OUTPUT_DATA_DIR = "./randomized_flat_dataset/"
 
-PATCH_SIZE = 256
-# Target around ~30-40k samples depending on number of source images
-PATCHES_PER_IMAGE = 400
-TRAIN_VAL_SPLIT = 0.9
-SAVE_DTYPE = np.float16  # reduce disk usage ~2x without affecting training (loader casts to float32)
+# For fixed training, we will generate a set of realistic samples.
+# For validation, we create a fixed, smaller set.
+NUM_TRAIN_SAMPLES = 20000
+NUM_VALIDATION_SAMPLES = 1000
 
-# Curriculum: increase severity from easy to hard over N patches
-CURRICULUM_WARMUP_PATCHES = 10000
+# Practical limits to keep memory usage reasonable.
+MAX_IMAGE_DIM = 1024
+SAVE_DTYPE = np.float16
+# Compress per-array files to save disk space. Loader supports both .npy and .npz.
+SAVE_COMPRESSED = True  # True → .npz (zip/deflate), False → .npy
+
+# Curriculum for sample generation
+CURRICULUM_WARMUP_SAMPLES = 500
 
 
 # =============================
-# 2) Image Loading
+# 2) Image Loading & Preparation
 # =============================
 
 def load_astro_image(image_path: str) -> np.ndarray:
@@ -79,7 +75,6 @@ def load_astro_image(image_path: str) -> np.ndarray:
             with Image.open(image_path) as img:
                 image_data = np.array(img.convert("L"))
         else:
-            # Skip unsupported formats silently to keep generator resilient
             return None
         if image_data is None:
             return None
@@ -90,382 +85,55 @@ def load_astro_image(image_path: str) -> np.ndarray:
         print(f"Failed to load {image_path}: {exc}")
         return None
 
+def resize_image(img: np.ndarray, max_dim: int) -> np.ndarray:
+    """Resize image if its largest dimension exceeds max_dim."""
+    h, w = img.shape
+    if max(h, w) <= max_dim:
+        return img
+    
+    if h > w:
+        new_h = max_dim
+        new_w = int(w * (max_dim / h))
+    else:
+        new_w = max_dim
+        new_h = int(h * (max_dim / w))
+        
+    img_t = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)
+    new_h = new_h if new_h % 2 == 0 else new_h - 1
+    new_w = new_w if new_w % 2 == 0 else new_w - 1
+    
+    resized_t = F.interpolate(img_t, size=(new_h, new_w), mode='area')
+    return resized_t.squeeze(0).squeeze(0).numpy()
 
-# =============================
-# 3) Synthetic Field Generators
-# =============================
+def pad_to_sixteen(img: np.ndarray) -> np.ndarray:
+    """Pads a 2D numpy array so its dimensions are divisible by 16."""
+    h, w = img.shape
+    pad_h = (16 - h % 16) % 16
+    pad_w = (16 - w % 16) % 16
 
-def make_meshgrid(h: int, w: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    yy, xx = torch.meshgrid(
-        torch.linspace(0, 1, h, device=device),
-        torch.linspace(0, 1, w, device=device),
-        indexing="ij",
-    )
-    return yy, xx
-
-
-def generate_vignetting_field(h: int, w: int, strength: float, order: float, center_jitter: float, device: torch.device) -> torch.Tensor:
-    """
-    Generate a multiplicative vignetting field around 1.0.
-      strength: negative darkens corners, positive brightens
-      order:    controls radial falloff shape (2..6 typical)
-      center_jitter: relative offset of center (0..0.2)
-    """
-    yy, xx = make_meshgrid(h, w, device)
-    # Randomized optical center
-    cx = 0.5 + random.uniform(-center_jitter, center_jitter)
-    cy = 0.5 + random.uniform(-center_jitter, center_jitter)
-    rr = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    rr = rr / torch.sqrt(torch.tensor(0.5 ** 2 + 0.5 ** 2, device=device))  # normalize to [0, ~1]
-    rr = torch.clamp(rr, 0.0, 1.0)
-    field = 1.0 + strength * (rr ** order)
-    return field
-
-
-def generate_prnu_field(h: int, w: int, amplitude: float, cell: int, device: torch.device) -> torch.Tensor:
-    """
-    PRNU-like low-frequency multiplicative noise around 1.0.
-    Create a coarse random grid and upsample with bicubic to smoothness.
-    """
-    coarse_h = max(2, h // cell)
-    coarse_w = max(2, w // cell)
-    coarse = torch.rand((1, 1, coarse_h, coarse_w), device=device)
-    up = F.interpolate(coarse, size=(h, w), mode="bicubic", align_corners=True)
-    up = (up - up.min()) / (up.max() - up.min() + 1e-8)
-    # Map to [1 - a, 1 + a]
-    field = 1.0 + amplitude * (up.squeeze(0).squeeze(0) * 2.0 - 1.0)
-    return field
+    if pad_h == 0 and pad_w == 0:
+        return img
+    
+    return np.pad(img, ((0, pad_h), (0, pad_w)), mode='reflect')
 
 
-def gaussian_ring(h: int, w: int, y0: float, x0: float, r0: float, sigma_r: float, gain: float, device: torch.device) -> torch.Tensor:
-    """
-    Return multiplicative map for a donut-shaped mote.
-      gain < 1 -> dark ring, gain > 1 -> bright ring
-    """
-    yy, xx = make_meshgrid(h, w, device)
-    r = torch.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
-    ring = torch.exp(-0.5 * ((r - r0) / (sigma_r + 1e-6)) ** 2)
-    # Blend ring around 1.0 with amplitude (gain - 1)
-    return 1.0 + (gain - 1.0) * ring
-
-
-def gaussian_disc(h: int, w: int, y0: float, x0: float, sigma: float, gain: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    r2 = (xx - x0) ** 2 + (yy - y0) ** 2
-    disc = torch.exp(-0.5 * r2 / (sigma ** 2 + 1e-6))
-    return 1.0 + (gain - 1.0) * disc
-
-
-def _make_lowfreq_noise(h: int, w: int, scale: int, device: torch.device) -> torch.Tensor:
-    """Perlin-like low-frequency noise in [-1,1] via bicubic upsampling of a coarse grid."""
-    coarse_h = max(2, h // max(1, scale))
-    coarse_w = max(2, w // max(1, scale))
-    grid = torch.rand((1, 1, coarse_h, coarse_w), device=device)
-    up = F.interpolate(grid, size=(h, w), mode="bicubic", align_corners=True)
-    up = (up - up.min()) / (up.max() - up.min() + 1e-8)
-    return up.squeeze(0).squeeze(0) * 2.0 - 1.0
-
-
-def _elliptical_radius(xx: torch.Tensor, yy: torch.Tensor, cx: float, cy: float,
-                       a: float, b: float, theta: float) -> torch.Tensor:
-    """
-    Normalized elliptical radius r such that r=1 lies on the ellipse boundary.
-    a and b are semi-axes (relative to [0,1] image coordinates).
-    """
-    # Shift to center
-    x = xx - cx
-    y = yy - cy
-    c, s = math.cos(theta), math.sin(theta)
-    xr = c * x + s * y
-    yr = -s * x + c * y
-    r = torch.sqrt((xr / (a + 1e-8)) ** 2 + (yr / (b + 1e-8)) ** 2)
-    return r
-
-
-def _softstep(x: torch.Tensor, k: float) -> torch.Tensor:
-    """Fast smooth step using sigmoid; k controls edge softness."""
-    return torch.sigmoid(x / (k + 1e-6))
-
-
-def _radial_distance(h: int, w: int, cx: float, cy: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    return torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-
-
-def _circular_mask_jittered(h: int, w: int, cx: float, cy: float, radius: float,
-                            edge: float, rough_amp: float, device: torch.device) -> torch.Tensor:
-    rr = _radial_distance(h, w, cx, cy, device)
-    jitter = _make_lowfreq_noise(h, w, scale=48, device=device)
-    boundary = radius * (1.0 + rough_amp * jitter)
-    return _softstep(boundary - rr, edge)
-
-
-def _donut_mask_jittered(h: int, w: int, cx: float, cy: float,
-                         r_inner: float, r_outer: float, edge: float,
-                         rough_amp: float, device: torch.device) -> torch.Tensor:
-    rr = _radial_distance(h, w, cx, cy, device)
-    jitter1 = _make_lowfreq_noise(h, w, scale=44, device=device)
-    jitter2 = _make_lowfreq_noise(h, w, scale=44, device=device)
-    b_in = r_inner * (1.0 + 0.6 * rough_amp * jitter1)
-    b_out = r_outer * (1.0 + rough_amp * jitter2)
-    outer = _softstep(b_out - rr, edge)
-    inner = _softstep(b_in - rr, edge)
-    return torch.clamp(outer - inner, 0.0, 1.0)
-
-
-def _common_donut_mote(h: int, w: int, cx: float, cy: float,
-                       r0: float, thickness: float, edge: float,
-                       rough_amp: float, depth: float,
-                       center_rel: float, center_scale: float,
-                       device: torch.device) -> torch.Tensor:
-    """
-    Generate a typical dust mote donut: a darker soft ring with a slightly
-    lighter interior. Kept circular with modest boundary roughness.
-
-    Returns multiplicative field contribution in [0.05, 1.0+]. Will be clamped later.
-    """
-    rr = _radial_distance(h, w, cx, cy, device)
-
-    # Boundary jitter (low-frequency) to avoid perfect ring
-    jitter = _make_lowfreq_noise(h, w, scale=48, device=device) * rough_amp
-    rr_j = rr * (1.0 + jitter)
-
-    sigma_ring = max(1e-4, thickness / 2.355)
-    ring = torch.exp(-0.5 * ((rr_j - r0) / (sigma_ring + 1e-6)) ** 2)
-
-    # Slightly soften edges
-    ring = ring * _softstep(r0 + thickness - rr_j, edge)
-    ring = ring * _softstep(rr_j - (r0 - thickness), edge)
-
-    # Center dimming (weaker than ring): keep center fuzzy but not as dark as ring
-    sigma_center = max(1e-4, r0 * center_rel)
-    center = torch.exp(-0.5 * (rr / (sigma_center + 1e-6)) ** 2)
-    center_depth = depth * center_scale
-
-    # Attenuation profile: dark thick ring and softer center dimming
-    mote = 1.0 - depth * ring - center_depth * center
-    mote = torch.clamp(mote, 0.05, 1.05)
-    return mote
-
-
-def _irregular_disc_mask(h: int, w: int, cx: float, cy: float, a: float, b: float,
-                         theta: float, edge: float, rough_amp: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    r = _elliptical_radius(xx, yy, cx, cy, a, b, theta)
-    rough = _make_lowfreq_noise(h, w, scale=int(32), device=device)
-    r = r + rough_amp * rough
-    # Inside ellipse -> r < 1
-    mask = _softstep(1.0 - r, edge)
-    return torch.clamp(mask, 0.0, 1.0)
-
-
-def _irregular_ring_mask(h: int, w: int, cx: float, cy: float, a: float, b: float,
-                         theta: float, r0: float, thickness: float, edge: float,
-                         rough_amp: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    r = _elliptical_radius(xx, yy, cx, cy, a, b, theta)
-    rough = _make_lowfreq_noise(h, w, scale=int(28), device=device)
-    r = r + rough_amp * rough
-    band = torch.exp(-0.5 * ((r - r0) / (thickness / 2.355 + 1e-6)) ** 2)
-    # Slightly soften the band edges
-    band = band * _softstep(1.2 - r, edge)
-    return torch.clamp(band, 0.0, 1.0)
-
-
-def _soft_disc_mask(h: int, w: int, cy: float, cx: float, radius: float, edge: float, device: torch.device) -> torch.Tensor:
-    """Soft-edged circular mask in [0,1]; 1 inside the disc, 0 outside."""
-    yy, xx = make_meshgrid(h, w, device)
-    r = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    # mask ~ 1 for r < radius, soft transition with width 'edge'
-    return torch.sigmoid((radius - r) / (edge + 1e-6))
-
-
-def _soft_ring_mask(h: int, w: int, cy: float, cx: float, r_inner: float, r_outer: float, edge: float, device: torch.device) -> torch.Tensor:
-    """Soft-edged ring/band mask in [0,1]."""
-    yy, xx = make_meshgrid(h, w, device)
-    r = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    inner = torch.sigmoid((r_inner - r) / (edge + 1e-6))  # 1 inside inner radius
-    outer = torch.sigmoid((r_outer - r) / (edge + 1e-6))  # 1 inside outer radius
-    # Ring band: inside outer but outside inner
-    return torch.clamp(outer - inner, 0.0, 1.0)
-
-
-def generate_dust_field(
-    h: int,
-    w: int,
-    num_motes: int,
-    device: torch.device,
-    difficulty: float,
-    mote_weights: tuple | list | None = None,
-    common_params_override: dict | None = None,
-) -> torch.Tensor:
-    """
-    Strong, realistic dust occlusions (rings and discs) as multiplicative field.
-    - Elliptical, rotated shapes with rough edges
-    - Interior non-uniformity using low-frequency noise
-    - Occasional multi-ring structure for 3D-like donuts
-    """
-    field = torch.ones((h, w), device=device)
-    for _ in range(num_motes):
-        cx = random.random()
-        cy = random.random()
-        # Circular base (limit eccentricity)
-        base_r = random.uniform(0.03, 0.10 + 0.15 * difficulty)
-        edge = random.uniform(0.004, 0.015 + 0.015 * difficulty)
-        rough_amp = random.uniform(0.0, 0.04 + 0.05 * difficulty)
-
-        interior_noise = _make_lowfreq_noise(h, w, scale=56, device=device)
-        interior = (interior_noise * 0.5 + 0.5)
-
-        # Favor common donut motes; allow external override for demos/tests
-        if mote_weights is None:
-            weights = [0.65, 0.18, 0.12, 0.05]
-        else:
-            # normalize and validate
-            weights = list(mote_weights)
-            if len(weights) != 4:
-                raise ValueError("mote_weights must be a sequence of 4 numbers: (common, disc, ring, multi)")
-        mote_type = random.choices(["common", "disc", "ring", "multi"], weights=weights)[0]
-        very_dark = random.random() < (0.30 + 0.35 * difficulty)
-
-        if mote_type == "common":
-            # Typical donut: thicker ring, smaller center, fuzzy but not flat interior
-            tr = (0.28, 0.55)
-            cr = (0.18, 0.45)
-            cs = (0.35, 0.70)
-            es = (1.2, 2.2)
-            ra = 0.8
-            if common_params_override:
-                tr = common_params_override.get('thickness_range', tr)
-                cr = common_params_override.get('center_rel_range', cr)
-                cs = common_params_override.get('center_scale_range', cs)
-                es = common_params_override.get('edge_softness_scale', es)
-                ra = common_params_override.get('rough_amp_scale', ra)
-
-            thickness = base_r * random.uniform(*tr)
-            depth = (random.uniform(0.35, 0.75) if very_dark else random.uniform(0.22, 0.55))
-            center_rel = random.uniform(*cr)
-            center_scale = random.uniform(*cs)
-            edge_eff = edge * random.uniform(*es)
-            mote = _common_donut_mote(
-                h, w, cx, cy, base_r, thickness, edge_eff, rough_amp * ra,
-                depth, center_rel, center_scale, device
-            )
-
-        elif mote_type == "disc":
-            mask = _circular_mask_jittered(h, w, cx, cy, base_r, edge, rough_amp, device)
-            depth = (random.uniform(0.45, 0.75) if very_dark else random.uniform(0.25, 0.55))
-            # Slight edge darkening to emulate shadow boundary
-            rr = _radial_distance(h, w, cx, cy, device)
-            boundary = base_r
-            edge_enhance = torch.clamp(torch.exp(-((rr - boundary) ** 2) / (2 * (edge * 2.5 + 1e-6) ** 2)), 0.0, 1.0)
-            shading = 0.85 + 0.5 * interior
-            mote = 1.0 - depth * mask * (0.7 + 0.6 * edge_enhance) * shading
-
-        elif mote_type == "ring":
-            r_outer = base_r * random.uniform(0.95, 1.25)
-            r_inner = r_outer * random.uniform(0.55, 0.85)
-            mask = _donut_mask_jittered(h, w, cx, cy, r_inner, r_outer, edge, rough_amp, device)
-            depth = (random.uniform(0.35, 0.65) if very_dark else random.uniform(0.18, 0.45))
-            shading = 0.9 + 0.4 * interior
-            mote = 1.0 - depth * mask * shading
-
-        else:  # multi
-            r_outer = base_r * random.uniform(1.0, 1.35)
-            r_inner = r_outer * random.uniform(0.55, 0.85)
-            ring_outer = _donut_mask_jittered(h, w, cx, cy, r_outer * 0.85, r_outer, edge, rough_amp, device)
-            inner = _circular_mask_jittered(h, w, cx, cy, r_inner * 0.8, edge, rough_amp, device)
-            d_outer = random.uniform(0.12, 0.35)
-            d_inner = random.uniform(0.25, 0.55)
-            shading = 0.9 + 0.4 * interior
-            mote = 1.0 - (d_outer * ring_outer + d_inner * inner) * shading
-
-        field = field * torch.clamp(mote, 0.05, 3.0)
-
-    return torch.clamp(field, 0.02, 3.0)
-
-
-def generate_additive_gradient(h: int, w: int, magnitude: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    theta = random.uniform(0.0, math.tau)
-    # Unit direction
-    dx = math.cos(theta)
-    dy = math.sin(theta)
-    # Project onto direction, normalize to [0,1]
-    proj = (xx - 0.5) * dx + (yy - 0.5) * dy
-    proj = (proj - proj.min()) / (proj.max() - proj.min() + 1e-8)
-    grad = magnitude * proj
-    return grad
-
-
-def generate_amp_glow(h: int, w: int, magnitude: float, device: torch.device) -> torch.Tensor:
-    yy, xx = make_meshgrid(h, w, device)
-    corner = random.choice([(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)])
-    cx, cy = corner[1], corner[0]
-    r = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    # Exponential falloff from the corner
-    glow = magnitude * torch.exp(-3.0 * (r / (math.sqrt(2))) )
-    return glow
-
-
-def synthesize_fields(h: int, w: int, difficulty: float, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns (F_multiplicative, G_additive)
-    """
-    # Vignetting
-    vig_strength = random.uniform(-0.6, 0.4) * difficulty
-    vig_order = random.uniform(2.0, 5.5)
-    vig_center_jitter = random.uniform(0.0, 0.12) * difficulty
-    F_vig = generate_vignetting_field(h, w, vig_strength, vig_order, vig_center_jitter, device)
-
-    # PRNU
-    prnu_amp = random.uniform(0.0, 0.08) * difficulty
-    prnu_cell = random.choice([8, 12, 16, 24, 32])
-    F_prnu = generate_prnu_field(h, w, prnu_amp, prnu_cell, device)
-
-    # Dust motes
-    max_motes = int(2 + 10 * difficulty)
-    num_motes = random.randint(0, max_motes)
-    F_dust = generate_dust_field(h, w, num_motes, device, difficulty)
-
-    # Combine multiplicative fields
-    F_mul = torch.clamp(F_vig * F_prnu * F_dust, 0.1, 3.0)
-    # Normalize to mean 1.0 like calibrated flats
-    F_mul = F_mul / (F_mul.mean() + 1e-8)
-
-    # Additive gradient + amp glow
-    grad_mag = random.uniform(0.0, 0.20) * difficulty
-    G_grad = generate_additive_gradient(h, w, grad_mag, device)
-    glow_mag = random.uniform(0.0, 0.15) * difficulty
-    G_glow = generate_amp_glow(h, w, glow_mag, device)
-    G_add = torch.clamp(G_grad + G_glow, 0.0, 1.0)
-
-    return F_mul, G_add
-
-
-def apply_poisson_read_noise(image_lin: torch.Tensor, difficulty: float) -> torch.Tensor:
-    """
-    Optional shot + read noise model. image_lin is [0,1].
-    """
-    if difficulty <= 0.05:
-        return image_lin
-    # Scale to electrons
-    e_min, e_max = 5000.0, 60000.0
-    electrons = random.uniform(e_min, e_max)
-    lam = torch.clamp(image_lin, 0.0, 1.0) * electrons
-    # Poisson noise in float via gaussian approx when electrons large
-    noisy = lam + torch.randn_like(lam) * torch.sqrt(torch.clamp(lam, 1.0, None))
-    noisy = torch.clamp(noisy, 0.0, None)
-    # Add read noise (e-)
-    read_sigma = random.uniform(1.0, 10.0) * math.sqrt(difficulty)
-    noisy = noisy + torch.randn_like(noisy) * read_sigma
-    noisy = torch.clamp(noisy, 0.0, None)
-    # Back to [0,1]
-    return torch.clamp(noisy / (electrons + 1e-8), 0.0, 1.0)
+def _save_array(out_dir: str, base_name: str, array: np.ndarray):
+    """Save array as .npz (compressed) or .npy based on SAVE_COMPRESSED. base_name may end with .npy."""
+    os.makedirs(out_dir, exist_ok=True)
+    if base_name.endswith('.npy'):
+        base_root = base_name[:-4]
+    else:
+        base_root = base_name
+    if SAVE_COMPRESSED:
+        path = os.path.join(out_dir, base_root + '.npz')
+        np.savez_compressed(path, arr=array.astype(SAVE_DTYPE))
+    else:
+        path = os.path.join(out_dir, base_root + '.npy')
+        np.save(path, array.astype(SAVE_DTYPE))
 
 
 # =============================
-# 4) Main generation loop
+# 3) Main generation loop
 # =============================
 
 if __name__ == "__main__":
@@ -473,8 +141,12 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Prepare output directories
-    for sub in ["train/sharp", "train/affected", "train/flat", "train/grad",
-                "val/sharp", "val/affected", "val/flat", "val/grad"]:
+    # Train dir (fixed) needs full sets; keep dynamic preprocessed for future use
+    for sub in [
+        "train/sharp", "train/affected", "train/flat", "train/grad",
+        "train/sharp_processed",
+        "val/sharp", "val/affected", "val/flat", "val/grad"
+    ]:
         os.makedirs(os.path.join(OUTPUT_DATA_DIR, sub), exist_ok=True)
 
     # Enumerate images
@@ -483,64 +155,119 @@ if __name__ == "__main__":
     if not files:
         print(f"No valid images found in {SHARP_IMAGE_DIR}")
         raise SystemExit(1)
-    print(f"Found {len(files)} source images")
+    print(f"Found {len(files)} source images for processing.")
 
-    patch_counter = 0
-
-    for fname in tqdm(files, desc="Generating flat-field dataset"):
+    # --- Process training images (save base sharp files for optional dynamic use) ---
+    pbar_train = tqdm(files, desc="Processing sharp images for base set")
+    for fname in pbar_train:
         path = os.path.join(SHARP_IMAGE_DIR, fname)
         img = load_astro_image(path)
-        if img is None:
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
+            continue
+        
+        img = resize_image(img, MAX_IMAGE_DIM)
+        img = pad_to_sixteen(img)
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
+            continue
+        
+        # Normalize to [0,1] before saving
+        img_min, img_max = np.min(img), np.max(img)
+        if img_max > img_min:
+            img_norm = (img - img_min) / (img_max - img_min)
+        else:
+            img_norm = np.zeros_like(img)
+
+        save_path = os.path.join(OUTPUT_DATA_DIR, "train", "sharp_processed", f"{os.path.splitext(fname)[0]}.npy")
+        np.save(save_path, img_norm.astype(SAVE_DTYPE))
+
+    print(f"\nProcessed {len(files)} sharp images for base set (optional dynamic use).")
+
+    # --- Generate fixed training set ---
+    pbar_fixed = tqdm(range(NUM_TRAIN_SAMPLES), desc="Generating fixed training set")
+    for i in pbar_fixed:
+        fname = random.choice(files)
+        path = os.path.join(SHARP_IMAGE_DIR, fname)
+        img = load_astro_image(path)
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
+            continue
+        img = resize_image(img, MAX_IMAGE_DIM)
+        img = pad_to_sixteen(img)
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
             continue
         h, w = img.shape
-        if h < PATCH_SIZE or w < PATCH_SIZE:
+        img_t = torch.from_numpy(img)
+        # Curriculum difficulty ramp
+        difficulty = min(1.0, 0.2 + 0.8 * (i / max(1, NUM_TRAIN_SAMPLES - 1)))
+        # Global normalization to [0,1]
+        img_min = img_t.min()
+        img_max = img_t.max()
+        if float(img_max) > float(img_min):
+            gt_lin = (img_t - img_min) / (img_max - img_min)
+        else:
+            gt_lin = torch.zeros_like(img_t)
+        # Synthesize fields and affected
+        device_cpu = torch.device("cpu")
+        F_mul, G_add = synthesize_fields(h, w, difficulty, device_cpu)
+        affected = torch.clamp(gt_lin * F_mul + G_add, 0.0, 1.0)
+        affected = apply_poisson_read_noise(affected, difficulty)
+        # Save
+        gt_np = gt_lin.numpy().astype(SAVE_DTYPE)
+        aff_np = affected.numpy().astype(SAVE_DTYPE)
+        flat_np = F_mul.numpy().astype(SAVE_DTYPE)
+        grad_np = G_add.numpy().astype(SAVE_DTYPE)
+        base = f"train_sample_{i:06d}"
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "train", "sharp"), base, gt_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "train", "affected"), base, aff_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "train", "flat"), base, flat_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "train", "grad"), base, grad_np)
+    
+    # --- Generate fixed validation set ---
+    pbar_val = tqdm(range(NUM_VALIDATION_SAMPLES), desc="Generating fixed validation set")
+    for i in pbar_val:
+        # Pick a random source image each time
+        fname = random.choice(files)
+        path = os.path.join(SHARP_IMAGE_DIR, fname)
+        img = load_astro_image(path)
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
             continue
 
-        # Preconvert to torch to avoid repeated transfers
-        img_t = torch.from_numpy(img).to(device)
+        img = resize_image(img, MAX_IMAGE_DIM)
+        img = pad_to_sixteen(img)
+        if img is None or img.size == 0 or img.ndim != 2 or min(img.shape) == 0:
+            continue
+        h, w = img.shape
+        # --- BUG FIX ---
+        # All data generation must happen on the CPU to match the on-the-fly generator.
+        # Moving to GPU here was causing the artifact synthesis to fail silently.
+        device_cpu = torch.device("cpu")
+        img_t = torch.from_numpy(img).to(device_cpu)
+        
+        difficulty = min(1.0, 0.1 + 0.9 * (i / CURRICULUM_WARMUP_SAMPLES))
 
-        for _ in range(PATCHES_PER_IMAGE):
-            # Curriculum difficulty from 0.1 to 1.0
-            difficulty = min(1.0, 0.1 + 0.9 * (patch_counter / CURRICULUM_WARMUP_PATCHES))
+        # Normalize sharp image to [0,1]
+        img_min = img_t.min()
+        img_max = img_t.max()
+        if float(img_max) > float(img_min):
+            gt_lin = (img_t - img_min) / (img_max - img_min)
+        else:
+            gt_lin = torch.zeros_like(img_t)
 
-            y0 = random.randint(0, h - PATCH_SIZE)
-            x0 = random.randint(0, w - PATCH_SIZE)
-            gt_patch = img_t[y0:y0+PATCH_SIZE, x0:x0+PATCH_SIZE]
+        F_mul, G_add = synthesize_fields(h, w, difficulty, device_cpu)
+        affected = torch.clamp(gt_lin * F_mul + G_add, 0.0, 1.0)
+        affected = apply_poisson_read_noise(affected, difficulty)
 
-            # Normalize sharp patch to [0,1] per patch
-            gt_min = gt_patch.min()
-            gt_max = gt_patch.max()
-            if float(gt_max) > float(gt_min):
-                gt_lin = (gt_patch - gt_min) / (gt_max - gt_min)
-            else:
-                gt_lin = torch.zeros_like(gt_patch)
+        gt_np = gt_lin.detach().cpu().numpy().astype(SAVE_DTYPE)
+        aff_np = affected.detach().cpu().numpy().astype(SAVE_DTYPE)
+        flat_np = F_mul.detach().cpu().numpy().astype(SAVE_DTYPE)
+        grad_np = G_add.detach().cpu().numpy().astype(SAVE_DTYPE)
 
-            # Synthesize fields
-            F_mul, G_add = synthesize_fields(PATCH_SIZE, PATCH_SIZE, difficulty, device)
+        base = f"val_sample_{i:04d}"
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "val", "sharp"), base, gt_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "val", "affected"), base, aff_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "val", "flat"), base, flat_np)
+        _save_array(os.path.join(OUTPUT_DATA_DIR, "val", "grad"), base, grad_np)
 
-            # Compose affected image in linear domain
-            affected = torch.clamp(gt_lin * F_mul + G_add, 0.0, 1.0)
-
-            # Optional noise
-            affected = apply_poisson_read_noise(affected, difficulty)
-
-            # Move to CPU numpy
-            gt_np = gt_lin.detach().cpu().numpy().astype(SAVE_DTYPE)
-            aff_np = affected.detach().cpu().numpy().astype(SAVE_DTYPE)
-            flat_np = F_mul.detach().cpu().numpy().astype(SAVE_DTYPE)
-            grad_np = G_add.detach().cpu().numpy().astype(SAVE_DTYPE)
-
-            # Save
-            subset = "train" if random.random() < TRAIN_VAL_SPLIT else "val"
-            base = f"patch_{patch_counter:06d}.npy"
-            np.save(os.path.join(OUTPUT_DATA_DIR, subset, "sharp", base), gt_np)
-            np.save(os.path.join(OUTPUT_DATA_DIR, subset, "affected", base), aff_np)
-            np.save(os.path.join(OUTPUT_DATA_DIR, subset, "flat", base), flat_np)
-            np.save(os.path.join(OUTPUT_DATA_DIR, subset, "grad", base), grad_np)
-
-            patch_counter += 1
-
-    print(f"\nFlat-field dataset complete. Generated {patch_counter} samples.")
-    print(f"Saved to: {OUTPUT_DATA_DIR}")
+    print(f"\nGenerated {NUM_VALIDATION_SAMPLES} fixed samples for the validation set.")
+    print(f"Dataset preparation complete. Saved to: {OUTPUT_DATA_DIR}")
 
 
